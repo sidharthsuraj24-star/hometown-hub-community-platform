@@ -77,13 +77,19 @@ test('account registration and platform admin bootstrap use an empty database', 
   assert.equal(profile.email, 'first@example.test');
   const me = await call(ctx, member, '/api/me');
   assert.equal(me.data.user.id, profile.id);
+  const updated = await call(ctx, member, '/api/profile', 'POST', { name: 'First Member', hometown: 'Example Village', bio: 'Glad to stay connected with neighbors.' });
+  assert.equal(updated.response.status, 200, JSON.stringify(updated.data));
+  assert.equal(updated.data.user.hometown, 'Example Village');
+  assert.equal(updated.data.user.bio, 'Glad to stay connected with neighbors.');
+  const refreshed = await call(ctx, member, '/api/me');
+  assert.equal(refreshed.data.user.hometown, 'Example Village');
 });
 
 test('community requests require platform review and member approval; moderators can pin posts', async t => {
   const ctx = await fixture(t), admin = ctx.admin, owner = { cookie: '' }, member = { cookie: '' }, outsider = { cookie: '' };
   await loginAdmin(ctx, admin);
   const ownerUser = await register(ctx, owner, 'Community Owner', 'owner@example.test');
-  await register(ctx, member, 'Joining Member', 'member@example.test');
+  const memberUser = await register(ctx, member, 'Joining Member', 'member@example.test');
   await register(ctx, outsider, 'Non-member', 'outsider@example.test');
   const communityId = await createApprovedCommunity(ctx, owner, admin);
   await joinAndApprove(ctx, member, owner, communityId);
@@ -97,6 +103,14 @@ test('community requests require platform review and member approval; moderators
   assert.equal(feed.data.posts[0].pinned, 1);
   assert.equal(feed.data.posts[0].kind, 'announcement');
   assert.equal(feed.data.posts[0].can_moderate, false);
+  const promoted = await call(ctx, admin, `/api/admin/communities/${communityId}/members/${memberUser.id}/role`, 'POST', { role: 'moderator' });
+  assert.equal(promoted.response.status, 200, JSON.stringify(promoted.data));
+  const moderatorUnpin = await call(ctx, member, `/api/posts/${post.data.id}/pin`, 'POST', { pinned: false });
+  assert.equal(moderatorUnpin.response.status, 200, JSON.stringify(moderatorUnpin.data));
+  const demoted = await call(ctx, admin, `/api/admin/communities/${communityId}/members/${memberUser.id}/role`, 'POST', { role: 'member' });
+  assert.equal(demoted.response.status, 200, JSON.stringify(demoted.data));
+  const deniedAfterDemotion = await call(ctx, member, `/api/posts/${post.data.id}/pin`, 'POST', { pinned: true });
+  assert.equal(deniedAfterDemotion.response.status, 403);
   const memberImage = await call(ctx, member, feed.data.posts[0].image_path);
   assert.equal(memberImage.response.status, 200);
   assert.equal(memberImage.response.headers.get('cache-control'), 'private, no-store');
