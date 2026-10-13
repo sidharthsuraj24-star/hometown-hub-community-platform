@@ -107,6 +107,14 @@ The admin dashboard calculates DAU and rolling active members from authenticated
 
 The supplied brief sets a page-load target under three seconds. That target, production traffic capacity, concurrent-user scalability, and availability have **not** been measured in a production-like environment and are not claimed by the Phase 1 build. The container configuration is deployment-ready for a persistent single-instance host but is not a production release, cloud-managed database, or multi-instance architecture.
 
+### Non-functional verification (local evidence only)
+
+- **Performance:** A local preview check previously measured 1.18 seconds p95 to app-ready under 10 concurrent anonymous desktop sessions. The repeatable `npm run nfr:smoke` check exercises the homepage, CSS, JavaScript, favicon, metadata, and session endpoints with 10 concurrent anonymous clients; two fresh local runs measured 181.7 ms and 216.0 ms p95. This script measures HTTP app-shell readiness after response bodies arrive, **not** browser rendering, a production network, or production capacity. Timings are machine- and load-dependent.
+- **Concurrent event RSVPs:** The integration suite sends 8 simultaneous RSVP requests for 3 available places; exactly 3 are accepted and 5 receive HTTP 409. This verifies capacity enforcement in the supported single-process SQLite deployment, not across multiple app instances.
+- **Security:** Automated checks cover non-plaintext scrypt password storage, omission of password fields from API output, same-origin write rejection, logout invalidation, registration throttling, and production cookie/security headers. These checks do not constitute a formal security audit; sessions and rate limits remain process-local.
+- **Mobile usability:** A prior signed-in UI spot-check at 390×844 and 320×720 found no horizontal overflow. This is a layout check, not a full usability or accessibility study.
+- **Multiple cities and villages:** Profiles and communities accept separate bounded free-text hometown/location labels; automated tests retain city, village, and region values independently. There is no standardized geographic hierarchy, geocoding, or distance-based search. The SQLite application remains single-process and is not horizontally scalable as configured.
+
 ## 9. Future candidates (not implemented)
 
 - Native mobile applications and multi-language interface.

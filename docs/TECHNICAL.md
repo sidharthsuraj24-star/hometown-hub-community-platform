@@ -83,9 +83,19 @@ All write routes accept JSON, use same-origin checks when an `Origin` header is 
 
 No records, events, active members, or impact values are seeded. Zero activity and insufficient historical baseline are represented as such rather than estimated.
 
+## Non-functional verification and limits
+
+Run `npm run nfr:smoke` for a disposable local HTTP app-shell check. It starts an isolated SQLite database in a temporary directory, runs 10 concurrent anonymous clients, and has each retrieve `/`, `/styles.css`, `/app.js`, `/favicon.svg`, `/api/meta`, and `/api/me`. It reports p50/p95 latency from request start until all response bodies are consumed, and exits unsuccessfully when p95 is at or above 3 seconds. It removes its temporary database and does not modify the app's configured `DATA_DIR`.
+
+This is a lightweight HTTP regression check, **not** a browser-render/load test or evidence of production-network performance. Two fresh local runs measured 181.7 ms and 216.0 ms p95. A separate local preview observation measured 1.18 seconds p95 to app-ready under 10 concurrent anonymous desktop sessions; neither measurement is a production guarantee. A prior local signed-in test completed 130/130 requests across 13 simultaneous sessions with 48.5 ms p95, but that result is likewise limited to its test environment.
+
+The RSVP integration test exercises eight simultaneous members competing for three event places and asserts that exactly three succeed. Multi-locality tests use disposable city, village, and region strings to verify that profile and community labels remain distinct. Security regressions check password hashing/privacy, same-origin rejection, logout, rate limiting, and production transport/session headers. A prior responsive-layout spot-check found no horizontal overflow at 390×844 and 320×720; no formal usability, accessibility, or security audit has been completed.
+
+Multiple city/village communities are representable as free-text locations. Structured city/district hierarchies, geocoding, proximity search, shared multi-instance sessions/rate limiting, a managed database, production capacity, backups, and formal security review are not implemented or verified.
+
 ## Event-capacity correctness
 
-The RSVP handler runs `BEGIN IMMEDIATE`, checks an existing RSVP and counts active `going` RSVPs, and writes the RSVP within the same transaction. If capacity is full, the entire transaction rolls back with HTTP `409`. A simultaneous-capacity integration test checks one-seat contention. A multi-instance deployment needs a shared transactional database and operational testing before it can claim the same behavior.
+The RSVP handler runs `BEGIN IMMEDIATE`, checks an existing RSVP and counts active `going` RSVPs, and writes the RSVP within the same transaction. If capacity is full, the entire transaction rolls back with HTTP `409`. The integration suite tests eight simultaneous members competing for three places. A multi-instance deployment needs a shared transactional database and operational testing before it can claim the same behavior.
 
 ## Security controls and boundaries
 
@@ -99,4 +109,4 @@ The RSVP handler runs `BEGIN IMMEDIATE`, checks an existing RSVP and counts acti
 
 ## Verification
 
-Run `npm run check` for JavaScript syntax checks and API integration tests, including registration, community approval/member roles, image access controls, guideline authorization and notifications, event edit/cancel permissions, RSVP capacity enforcement and attendee notifications, data-derived KPI calculations, reporter case tracking/appeals, public case messages versus private admin notes, report status history, and report-schema migration. Tests use temporary SQLite databases and do not create repository seed data.
+Run `npm run check` for JavaScript syntax checks and API integration tests, including registration, community approval/member roles, image access controls, guideline authorization and notifications, event edit/cancel permissions, 8-way RSVP capacity enforcement and attendee notifications, data-derived KPI calculations, reporter case tracking/appeals, public case messages versus private admin notes, report status history, report-schema migration, multi-locality values, and security safeguards. Tests use temporary SQLite databases and do not create repository seed data. Run `npm run nfr:smoke` separately for the app-shell HTTP timing check described above.

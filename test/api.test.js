@@ -123,25 +123,24 @@ test('community requests require platform review and member approval; moderators
   assert.ok(ownerUser.id);
 });
 
-test('event capacity stays intact when two members RSVP simultaneously', async t => {
-  const ctx = await fixture(t), admin = ctx.admin, owner = { cookie: '' }, first = { cookie: '' }, second = { cookie: '' };
+test('event capacity stays intact when eight members RSVP simultaneously', async t => {
+  const ctx = await fixture(t), admin = ctx.admin, owner = { cookie: '' };
   await loginAdmin(ctx, admin);
   await register(ctx, owner, 'Event Host', 'host@example.test');
-  first.email = (await register(ctx, first, 'Guest One', 'guest-one@example.test')).email;
-  second.email = (await register(ctx, second, 'Guest Two', 'guest-two@example.test')).email;
+  const guests = Array.from({ length: 8 }, () => ({ cookie: '' }));
+  for (const [index, guest] of guests.entries()) {
+    await register(ctx, guest, `Guest ${index + 1}`, `guest-${index + 1}@example.test`);
+  }
   const communityId = await createApprovedCommunity(ctx, owner, admin);
-  await joinAndApprove(ctx, first, owner, communityId);
-  await joinAndApprove(ctx, second, owner, communityId);
-  const eventResult = await call(ctx, owner, '/api/events', 'POST', { community_id: communityId, title: 'Town Hall Picnic', description: 'Bring a dish to share with the community.', location: 'Community garden', starts_at: new Date(Date.now() + 86400000).toISOString(), capacity: 1 });
+  for (const guest of guests) await joinAndApprove(ctx, guest, owner, communityId);
+  const eventResult = await call(ctx, owner, '/api/events', 'POST', { community_id: communityId, title: 'Town Hall Picnic', description: 'Bring a dish to share with the community.', location: 'Community garden', starts_at: new Date(Date.now() + 86400000).toISOString(), capacity: 3 });
   assert.equal(eventResult.response.status, 201, JSON.stringify(eventResult.data));
   const eventId = eventResult.data.id;
-  const results = await Promise.all([
-    call(ctx, first, `/api/events/${eventId}/rsvp`, 'POST', { action: 'going' }),
-    call(ctx, second, `/api/events/${eventId}/rsvp`, 'POST', { action: 'going' })
-  ]);
-  assert.deepEqual(results.map(result => result.response.status).sort(), [200, 409]);
+  const results = await Promise.all(guests.map(guest => call(ctx, guest, `/api/events/${eventId}/rsvp`, 'POST', { action: 'going' })));
+  assert.equal(results.filter(result => result.response.status === 200).length, 3);
+  assert.equal(results.filter(result => result.response.status === 409).length, 5);
   const events = await call(ctx, owner, `/api/events?community=${communityId}`);
-  assert.equal(events.data.events[0].attendee_count, 1);
+  assert.equal(events.data.events[0].attendee_count, 3);
 });
 
 test('invalid event dates and unapproved-community posting are rejected safely', async t => {
