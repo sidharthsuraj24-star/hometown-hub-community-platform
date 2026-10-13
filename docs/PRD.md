@@ -1,0 +1,107 @@
+# Hometown Hub — Product Requirements Document
+
+**Status:** Phase 1 prototype implemented; private repository only; not deployed.
+**Product:** Hometown Hub
+**Product type:** Responsive web application for hometown and local communities.
+
+## 1. Problem and opportunity
+
+People move away from their hometowns for work or education and can lose touch with local relationships, traditions, and initiatives. Existing broad social platforms and fragmented group chats do not provide a structured, community-owned place for local discussions, announcements, and gatherings.
+
+Hometown Hub gives people a focused digital home for community updates and participation. The product should support connection without manufacturing community activity or presenting fictional records as real.
+
+## 2. Product objectives
+
+### Primary objectives
+
+1. Help people with a shared hometown or location connect digitally.
+2. Provide a central feed for community posts and discussions.
+3. Let members organize events and participate in them.
+4. Strengthen participation while giving communities straightforward moderation tools.
+
+### Secondary objectives
+
+- Support member-led cultural preservation, help, and collaboration.
+- Provide a platform structure that could support community-led news and alerts later; no official or emergency alert integrations are included now.
+
+## 3. Users and roles
+
+| Role | Capabilities |
+|---|---|
+| Visitor | View the sign-in/registration screen. Approved community listings are available after sign-in in this Phase 1 implementation. |
+| Member | Maintain a profile; discover communities; request membership; contribute posts and comments; like/share posts; create or RSVP to events; submit reports. |
+| Community moderator | Member capabilities plus approve/reject join requests, edit guidelines, pin posts, remove posts/comments, and manage community events. Community creators are moderators of their submitted community. |
+| Platform administrator | Review new communities, enable/disable member accounts, assign/remove community moderators, process reports, and manage category/tag vocabularies. |
+
+## 4. Phase 1 scope
+
+### Included and implemented
+
+- Web-based responsive interface, designed mobile-first.
+- Account registration, sign-in, and profile with name, hometown/region, and short bio.
+- Community creation requests, platform approval, directory, and join-request workflow.
+- Community feed with text posts, optional images, categories, announcements, comments, likes, share links, and moderator pinning/removal.
+- Events created by community members, including event details and creator-defined optional capacity.
+- Concurrent RSVP enforcement: a capacity-limited event never accepts more active RSVPs than its stated capacity in the tested single-process deployment.
+- In-app notifications for membership actions, community review, new posts/events, comments, and likes.
+- Community rules/guidelines, moderation actions, and an administrator dashboard.
+- Abuse reports for users, posts, comments, and communities.
+- Platform-managed post categories and community tags.
+- PRD, technical documentation, automated API tests, and a local run configuration.
+
+### Excluded
+
+- Native mobile applications, paid advertising, or marketplace/classifieds.
+- Advanced/AI moderation.
+- Emergency alert or government system integration.
+- External mail, SMS, web-push, or identity providers.
+- Production deployment, public release, live community data, or a cloud-managed database.
+- Fictional seed users, communities, local news, events, service providers, alerts, or performance/impact metrics.
+
+## 5. Functional requirements and acceptance checks
+
+| ID | Requirement | Acceptance evidence |
+|---|---|---|
+| U1 | Register and sign in | API integration tests create an account and use its session. Passwords are scrypt-hashed. |
+| U2 | Create/edit profile | Profile API stores a name, hometown/region, and bio; email is not included in post author data. |
+| C1 | Create a community | Request is stored as `pending` and the creator is made its moderator. It is not publicly listed before approval. |
+| C2 | Approve/reject creation | Platform-admin review changes the community state and notifies its creator. |
+| C3 | Join a community | Join request is `pending` until a moderator approves or rejects it. Feed access is restricted to active members. |
+| P1 | Post text, image, announcement | Active members can share posts. Optional images are verified PNG/JPEG/WebP files up to 1.5 MB. |
+| P2 | Engage with posts | Members can like, comment, and copy/share an in-app deep link. Moderators can pin posts. |
+| P3 | Moderate posts/comments | Authors can remove their own content; community moderators can remove content in their community. |
+| E1 | Create/manage events | Active community members can create events; event creators and moderators can cancel them. |
+| E2 | RSVP safely | RSVP uses an SQLite immediate transaction to check capacity and insert/update attendance atomically. A simultaneous-capacity integration test checks one-seat contention. |
+| N1 | Receive in-app notifications | Relevant community activity creates notification records; users can mark them read. No external push delivery is claimed. |
+| M1 | Manage membership and guidelines | Moderators can review membership requests and change community guidelines. |
+| A1 | Platform operations | Admin panel shows database-derived counts and provides community, account, moderator, report, category, and tag controls. |
+
+## 6. Safety, privacy, and content principles
+
+- Do not seed fake members, news, events, businesses, services, alerts, or community impact statistics.
+- Keep new community requests non-public until approval.
+- Store authentication passwords only as scrypt hashes and keep uploaded files and SQLite data out of Git.
+- Use same-site HTTP-only session cookies, same-origin checks on browser writes, login/registration throttling, restrictive security headers, input-size limits, and parameterized SQL statements.
+- Tell users what profile details are visible and encourage careful sharing.
+- Human moderators/admins handle content reports; the system does not promise automated detection or dispute adjudication.
+
+## 7. Product decisions and open question
+
+### Interpreted requirement
+
+“Supports concurrent bookings” is treated as a requirement for safe concurrent event RSVPs, not paid booking or appointment infrastructure. Capacity is optional and defined by the event creator.
+
+### Unresolved scope question — Pandit module
+
+The supplied brief lists “Pandit onboarding module” as a deliverable and “Sample Pandit Data,” but those phrases do not clearly align with the rest of the hometown social-community product. They may refer to Hindu-priest service listings, or may be copied from another project template. **Do not build the module or add sample Pandit records until the product owner confirms the intended meaning, target user, and workflow.**
+
+## 8. Success measurement
+
+The dashboard currently reports simple counts derived from stored project records (accounts, approved/pending communities, posts, upcoming events, and open reports). It does not seed data or calculate DAU, conversion, growth, or impact. Those KPIs require an agreed analytics/privacy policy and sufficient real usage; no values are claimed in this prototype.
+
+## 9. Future candidates (not implemented)
+
+- Native mobile applications and multi-language interface.
+- Optional local marketplace/classifieds.
+- Verified local-government updates and separately governed emergency alert integrations.
+- Email/push delivery, account verification/recovery, and advanced moderation support.

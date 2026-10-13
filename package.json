@@ -1,0 +1,14 @@
+{
+  "name": "hometown-hub-community-platform",
+  "version": "0.1.0",
+  "private": true,
+  "description": "A responsive hometown community platform with moderation and event RSVPs.",
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "scripts": {
+    "start": "node --env-file-if-exists=.env server.js",
+    "test": "node --test",
+    "check": "node --check server.js && node --check public/app.js && node --test"
+  }
+}
