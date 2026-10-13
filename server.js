@@ -33,8 +33,15 @@ function passwordMatches(password, salt, expected) {
   const target = Buffer.from(expected, 'hex');
   return target.length === actual.length && crypto.timingSafeEqual(actual, target);
 }
+const DUMMY_LOGIN_HASH = passwordHash('hometown-hub-login-timing-placeholder');
 function parseCookies(header = '') {
-  return Object.fromEntries(header.split(';').map(part => part.trim().split(/=(.*)/s).slice(0, 2)).filter(pair => pair.length === 2).map(([k, v]) => [k, decodeURIComponent(v)]));
+  const cookies = {};
+  for (const part of header.split(';')) {
+    const pair = part.trim().split(/=(.*)/s).slice(0, 2);
+    if (pair.length !== 2) continue;
+    try { cookies[pair[0]] = decodeURIComponent(pair[1]); } catch { cookies[pair[0]] = ''; }
+  }
+  return cookies;
 }
 function safeJson(value) {
   try { return JSON.parse(value); } catch { return null; }
@@ -105,7 +112,13 @@ function createApp(options = {}) {
     CREATE TABLE IF NOT EXISTS reports (
       id TEXT PRIMARY KEY, reporter_id TEXT NOT NULL REFERENCES users(id), target_type TEXT NOT NULL,
       target_id TEXT NOT NULL, reason TEXT NOT NULL, status TEXT NOT NULL DEFAULT 'open',
-      created_at TEXT NOT NULL, resolved_by TEXT REFERENCES users(id), resolved_at TEXT
+      created_at TEXT NOT NULL, resolved_by TEXT REFERENCES users(id), resolved_at TEXT,
+      resolution_note TEXT NOT NULL DEFAULT ''
+    );
+    CREATE TABLE IF NOT EXISTS user_activity (
+      user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+      activity_day TEXT NOT NULL, last_seen_at TEXT NOT NULL,
+      PRIMARY KEY (user_id, activity_day)
     );
     CREATE TABLE IF NOT EXISTS content_categories (name TEXT PRIMARY KEY, created_at TEXT NOT NULL);
     CREATE TABLE IF NOT EXISTS content_tags (name TEXT PRIMARY KEY, created_at TEXT NOT NULL);
@@ -115,7 +128,17 @@ function createApp(options = {}) {
     CREATE INDEX IF NOT EXISTS idx_events_community_start ON events(community_id, starts_at);
     CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_reports_status ON reports(status, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_activity_day ON user_activity(activity_day, user_id);
+    CREATE INDEX IF NOT EXISTS idx_comments_post_created ON comments(post_id, created_at);
+    CREATE INDEX IF NOT EXISTS idx_rsvps_event_status ON rsvps(event_id, status);
   `);
+
+  const reportColumns = db.prepare('PRAGMA table_info(reports)').all();
+  if (!reportColumns.some(column => column.name === 'resolution_note')) {
+    db.exec("ALTER TABLE reports ADD COLUMN resolution_note TEXT NOT NULL DEFAULT ''");
+  }
+  const activityRetentionCutoff = new Date(Date.now() - 89 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  db.prepare('DELETE FROM user_activity WHERE activity_day < ?').run(activityRetentionCutoff);
 
   const run = (sql, ...args) => db.prepare(sql).run(...args);
   const one = (sql, ...args) => db.prepare(sql).get(...args);
@@ -141,11 +164,15 @@ function createApp(options = {}) {
 
   const sessions = new Map();
   const loginAttempts = new Map();
+  let lastRateSweep = 0;
   const isProduction = (options.nodeEnv || process.env.NODE_ENV) === 'production';
   const headers = {
     'X-Content-Type-Options': 'nosniff', 'X-Frame-Options': 'DENY',
+    'X-DNS-Prefetch-Control': 'off', 'X-Permitted-Cross-Domain-Policies': 'none',
+    'Cross-Origin-Opener-Policy': 'same-origin',
     'Referrer-Policy': 'strict-origin-when-cross-origin', 'Permissions-Policy': 'camera=(), microphone=(), geolocation=()',
-    'Content-Security-Policy': "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'"
+    'Content-Security-Policy': "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
+    ...(isProduction ? { 'Strict-Transport-Security': 'max-age=63072000; includeSubDomains' } : {})
   };
   function send(res, status, data, extra = {}) {
     res.writeHead(status, { ...headers, 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', ...extra });
@@ -157,12 +184,18 @@ function createApp(options = {}) {
     if (isProduction) bits.push('Secure');
     return bits.join('; ');
   }
+  function recordActivity(user) {
+    if (!user || user.role === 'admin') return;
+    const seenAt = now();
+    run('INSERT INTO user_activity(user_id,activity_day,last_seen_at) VALUES(?,?,?) ON CONFLICT(user_id,activity_day) DO UPDATE SET last_seen_at=excluded.last_seen_at', user.id, seenAt.slice(0, 10), seenAt);
+  }
   function sessionUser(req) {
     const token = parseCookies(req.headers.cookie)[COOKIE_NAME];
     const session = token && sessions.get(token);
     if (!session || session.expires < Date.now()) { if (token) sessions.delete(token); return null; }
     const user = one('SELECT id,email,name,hometown,bio,role,disabled,created_at FROM users WHERE id = ?', session.userId);
     if (!user || user.disabled) { sessions.delete(token); return null; }
+    recordActivity(user);
     return user;
   }
   function requireUser(req) {
@@ -225,6 +258,13 @@ function createApp(options = {}) {
     const ip = req.socket.remoteAddress || 'unknown';
     const id = `${key}:${ip}`;
     const time = Date.now();
+    if (time - lastRateSweep > 60_000) {
+      lastRateSweep = time;
+      for (const [bucket, attempts] of loginAttempts) {
+        const fresh = attempts.filter(ts => time - ts < 15 * 60 * 1000);
+        if (fresh.length) loginAttempts.set(bucket, fresh); else loginAttempts.delete(bucket);
+      }
+    }
     const old = loginAttempts.get(id) || [];
     const recent = old.filter(ts => time - ts < 15 * 60 * 1000);
     if (recent.length >= 12) fail(429, 'Too many attempts. Please wait 15 minutes and try again.');
@@ -241,6 +281,103 @@ function createApp(options = {}) {
     const counts = one('SELECT (SELECT COUNT(*) FROM likes WHERE post_id=?) AS likes, (SELECT COUNT(*) FROM comments WHERE post_id=?) AS comments, (SELECT COUNT(*) FROM shares WHERE post_id=?) AS shares', post.id, post.id, post.id);
     const comments = many('SELECT c.id,c.body,c.created_at,u.id AS user_id,u.name AS user_name FROM comments c JOIN users u ON u.id=c.user_id WHERE c.post_id=? ORDER BY c.created_at ASC LIMIT 100', post.id);
     return { ...post, author_name: post.user_name, community_name: post.community_name, can_moderate: post.my_role === 'moderator' || currentUser.role === 'admin', liked_by_me: Boolean(one('SELECT 1 FROM likes WHERE post_id=? AND user_id=?', post.id, currentUser.id)), like_count: counts.likes, comment_count: counts.comments, share_count: counts.shares, comments };
+  }
+
+  function analyticsSnapshot() {
+    const today = new Date();
+    const dayOffset = days => new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate() + days)).toISOString().slice(0, 10);
+    const todayKey = dayOffset(0), sevenDayStart = dayOffset(-6), periodStart = dayOffset(-29), previousStart = dayOffset(-59);
+    const periodTimestamp = `${periodStart}T00:00:00.000Z`, previousTimestamp = `${previousStart}T00:00:00.000Z`;
+    const tomorrowTimestamp = `${dayOffset(1)}T00:00:00.000Z`, currentTime = now();
+    const activeToday = one('SELECT COUNT(*) AS n FROM user_activity WHERE activity_day=?', todayKey).n;
+    const activeSevenDays = one('SELECT COUNT(DISTINCT user_id) AS n FROM user_activity WHERE activity_day>=? AND activity_day<=?', sevenDayStart, todayKey).n;
+    const activeThirtyDays = one('SELECT COUNT(DISTINCT user_id) AS n FROM user_activity WHERE activity_day>=? AND activity_day<=?', periodStart, todayKey).n;
+    const engagedThirtyDays = one(`SELECT COUNT(DISTINCT user_id) AS n FROM (
+      SELECT user_id FROM posts WHERE created_at>=? AND created_at<?
+      UNION SELECT user_id FROM comments WHERE created_at>=? AND created_at<?
+      UNION SELECT user_id FROM likes WHERE created_at>=? AND created_at<?
+      UNION SELECT user_id FROM shares WHERE created_at>=? AND created_at<?
+      UNION SELECT user_id FROM rsvps WHERE status='going' AND created_at>=? AND created_at<?
+    )`, periodTimestamp, tomorrowTimestamp, periodTimestamp, tomorrowTimestamp, periodTimestamp, tomorrowTimestamp, periodTimestamp, tomorrowTimestamp, periodTimestamp, tomorrowTimestamp).n;
+    const posts = one(`SELECT COUNT(*) AS total,
+      SUM(CASE WHEN EXISTS (SELECT 1 FROM likes l WHERE l.post_id=p.id AND l.created_at>=?)
+        OR EXISTS (SELECT 1 FROM comments c WHERE c.post_id=p.id AND c.created_at>=?)
+        OR EXISTS (SELECT 1 FROM shares s WHERE s.post_id=p.id AND s.created_at>=?) THEN 1 ELSE 0 END) AS engaged
+      FROM posts p WHERE p.created_at>=? AND p.created_at<?`, periodTimestamp, periodTimestamp, periodTimestamp, periodTimestamp, tomorrowTimestamp);
+    const eventRsvp = one(`SELECT COALESCE(SUM((SELECT COUNT(*) FROM rsvps r WHERE r.event_id=e.id AND r.status='going')),0) AS going,
+      COALESCE(SUM((SELECT COUNT(*) FROM memberships m WHERE m.community_id=e.community_id AND m.status='active')),0) AS opportunities
+      FROM events e JOIN communities c ON c.id=e.community_id
+      WHERE e.status='open' AND c.status='approved' AND e.created_at>=? AND e.created_at<? AND e.starts_at>=?`, periodTimestamp, tomorrowTimestamp, currentTime);
+    const countsInPeriod = (table, extraWhere = '') => ({
+      current: one(`SELECT COUNT(*) AS n FROM ${table} WHERE created_at>=? AND created_at<? ${extraWhere}`, periodTimestamp, tomorrowTimestamp).n,
+      previous: one(`SELECT COUNT(*) AS n FROM ${table} WHERE created_at>=? AND created_at<? ${extraWhere}`, previousTimestamp, periodTimestamp).n
+    });
+    const membersGrowth = countsInPeriod('users', "AND role<>'admin'");
+    const communityGrowth = {
+      current: one("SELECT COUNT(*) AS n FROM communities WHERE status='approved' AND created_at>=? AND created_at<?", periodTimestamp, tomorrowTimestamp).n,
+      previous: one("SELECT COUNT(*) AS n FROM communities WHERE status='approved' AND created_at>=? AND created_at<?", previousTimestamp, periodTimestamp).n
+    };
+    const growthRate = values => values.previous ? Math.round(((values.current - values.previous) / values.previous) * 1000) / 10 : null;
+    const dailyActive = many('SELECT activity_day,COUNT(*) AS active_users FROM user_activity WHERE activity_day>=? AND activity_day<=? GROUP BY activity_day ORDER BY activity_day', periodStart, todayKey);
+    const dailyMap = new Map(dailyActive.map(row => [row.activity_day, row.active_users]));
+    const dailyActiveTrend = Array.from({ length: 30 }, (_, index) => {
+      const day = dayOffset(index - 29);
+      return { day, active_users: dailyMap.get(day) || 0 };
+    });
+    return {
+      period_days: 30,
+      computed_at: currentTime,
+      dau: activeToday,
+      active_users_7d: activeSevenDays,
+      active_users_30d: activeThirtyDays,
+      engaged_users_30d: engagedThirtyDays,
+      engagement_rate_30d: activeThirtyDays ? Math.round((engagedThirtyDays / activeThirtyDays) * 1000) / 10 : null,
+      post_engagement_rate_30d: posts.total ? Math.round((posts.engaged / posts.total) * 1000) / 10 : null,
+      user_growth: { ...membersGrowth, growth_percent: growthRate(membersGrowth) },
+      community_growth: { ...communityGrowth, growth_percent: growthRate(communityGrowth) },
+      event_participation: {
+        going_rsvps: eventRsvp.going,
+        eligible_member_event_pairs: eventRsvp.opportunities,
+        rate_percent: eventRsvp.opportunities ? Math.round((eventRsvp.going / eventRsvp.opportunities) * 1000) / 10 : null
+      },
+      daily_active_trend: dailyActiveTrend
+    };
+  }
+
+  function reportTargetInfo(report) {
+    let target = null;
+    let summary = 'Target is no longer available.';
+    let context = '';
+    let link = '';
+    if (report.target_type === 'post') {
+      target = one('SELECT p.id,p.body,u.name AS author_name,c.id AS community_id,c.name AS community_name FROM posts p JOIN users u ON u.id=p.user_id JOIN communities c ON c.id=p.community_id WHERE p.id=?', report.target_id);
+      if (target) {
+        summary = target.body;
+        context = `Post by ${target.author_name} in ${target.community_name}`;
+        link = `/?community=${encodeURIComponent(target.community_id)}#post-${encodeURIComponent(target.id)}`;
+      }
+    } else if (report.target_type === 'comment') {
+      target = one('SELECT cm.id,cm.body,u.name AS author_name,p.id AS post_id,p.body AS post_body,c.id AS community_id,c.name AS community_name FROM comments cm JOIN users u ON u.id=cm.user_id JOIN posts p ON p.id=cm.post_id JOIN communities c ON c.id=p.community_id WHERE cm.id=?', report.target_id);
+      if (target) {
+        summary = target.body;
+        context = `Comment by ${target.author_name} on “${target.post_body}” in ${target.community_name}`;
+        link = `/?community=${encodeURIComponent(target.community_id)}#post-${encodeURIComponent(target.post_id)}`;
+      }
+    } else if (report.target_type === 'community') {
+      target = one('SELECT id,name,location,description FROM communities WHERE id=?', report.target_id);
+      if (target) {
+        summary = target.name;
+        context = `${target.location} · ${target.description}`;
+        link = `/?community=${encodeURIComponent(target.id)}`;
+      }
+    } else if (report.target_type === 'user') {
+      target = one('SELECT id,name,hometown FROM users WHERE id=?', report.target_id);
+      if (target) {
+        summary = target.name;
+        context = target.hometown ? `Reported account · Hometown: ${target.hometown}` : 'Reported account';
+      }
+    }
+    return { target_summary: text(summary, 1000), target_context: text(context, 1200), target_link: link, target_available: Boolean(target) };
   }
 
   async function api(req, res, url) {
@@ -269,7 +406,8 @@ function createApp(options = {}) {
       rateLimit(req, 'login');
       const email = emailValue(body.email), password = typeof body.password === 'string' ? body.password : '';
       const account = one('SELECT * FROM users WHERE email = ?', email);
-      if (!account || account.disabled || !passwordMatches(password, account.password_salt, account.password_hash)) fail(401, 'Email or password is incorrect.');
+      const passwordOk = passwordMatches(password.slice(0, 128), account?.password_salt || DUMMY_LOGIN_HASH.salt, account?.password_hash || DUMMY_LOGIN_HASH.hash);
+      if (!account || account.disabled || password.length > 128 || !passwordOk) fail(401, 'Email or password is incorrect.');
       const token = crypto.randomBytes(32).toString('base64url'); sessions.set(token, { userId: account.id, expires: Date.now() + SESSION_TTL });
       send(res, 200, { user: { id: account.id, email: account.email, name: account.name, hometown: account.hometown, bio: account.bio, role: account.role, created_at: account.created_at } }, { 'Set-Cookie': cookie(token) }); return true;
     }
@@ -478,6 +616,7 @@ function createApp(options = {}) {
     }
 
     if (method === 'POST' && parts[1] === 'reports') {
+      rateLimit(req, 'report');
       const user = requireUser(req), targetType = text(body.target_type, 20), targetId = text(body.target_id, 64), reason = text(body.reason, 1000);
       if (!['user', 'post', 'comment', 'community'].includes(targetType) || !targetId || reason.length < 10) fail(400, 'Choose content to report and describe the issue in at least 10 characters.');
       const exists = targetType === 'user' ? one('SELECT id FROM users WHERE id=?', targetId) : targetType === 'post' ? one('SELECT id FROM posts WHERE id=?', targetId) : targetType === 'comment' ? one('SELECT id FROM comments WHERE id=?', targetId) : one('SELECT id FROM communities WHERE id=?', targetId);
@@ -498,10 +637,10 @@ function createApp(options = {}) {
       };
       const communities = many("SELECT c.*,u.name AS creator_name FROM communities c JOIN users u ON u.id=c.created_by WHERE c.status='pending' ORDER BY c.created_at",);
       const users = many('SELECT id,email,name,hometown,role,disabled,created_at FROM users ORDER BY created_at DESC LIMIT 100');
-      const reports = many("SELECT r.*,u.name AS reporter_name FROM reports r JOIN users u ON u.id=r.reporter_id ORDER BY CASE r.status WHEN 'open' THEN 0 ELSE 1 END,r.created_at DESC LIMIT 100");
+      const reports = many("SELECT r.*,u.name AS reporter_name FROM reports r JOIN users u ON u.id=r.reporter_id ORDER BY CASE r.status WHEN 'open' THEN 0 ELSE 1 END,r.created_at DESC LIMIT 100").map(report => ({ ...report, ...reportTargetInfo(report) }));
       const moderators = many("SELECT m.community_id,m.user_id,m.created_at,u.name AS user_name,c.name AS community_name FROM memberships m JOIN users u ON u.id=m.user_id JOIN communities c ON c.id=m.community_id WHERE m.role='moderator' AND m.status='active'");
       const memberships = many("SELECT m.community_id,m.user_id,m.role,m.created_at,u.name AS user_name,c.name AS community_name FROM memberships m JOIN users u ON u.id=m.user_id JOIN communities c ON c.id=m.community_id WHERE m.status='active' AND c.status='approved' ORDER BY c.name,u.name");
-      send(res, 200, { counts, communities: communities.map(communitySummary), users, reports, categories: many('SELECT name,created_at FROM content_categories ORDER BY name'), tags: many('SELECT name,created_at FROM content_tags ORDER BY name'), moderators, memberships }); return true;
+      send(res, 200, { counts, analytics: analyticsSnapshot(), communities: communities.map(communitySummary), users, reports, categories: many('SELECT name,created_at FROM content_categories ORDER BY name'), tags: many('SELECT name,created_at FROM content_tags ORDER BY name'), moderators, memberships }); return true;
     }
     if (method === 'POST' && parts[1] === 'admin' && parts[2] === 'communities' && parts[3] && parts[4] === 'review') {
       const admin = requireAdmin(req), action = body.action, id = parts[3];
@@ -527,8 +666,13 @@ function createApp(options = {}) {
     }
     if (method === 'POST' && parts[1] === 'admin' && parts[2] === 'reports' && parts[3] && parts[4] === 'resolve') {
       const admin = requireAdmin(req), report = one('SELECT * FROM reports WHERE id=?', parts[3]); if (!report) fail(404, 'Report not found.');
-      const status = body.status === 'dismissed' ? 'dismissed' : 'resolved';
-      run('UPDATE reports SET status=?,resolved_by=?,resolved_at=? WHERE id=?', status, admin.id, now(), report.id); send(res, 200, { status }); return true;
+      const status = body.status;
+      if (!['open', 'resolved', 'dismissed'].includes(status)) fail(400, 'Choose open, resolved, or dismissed.');
+      const resolutionNote = text(body.resolution_note, 1000);
+      const resolvedAt = status === 'open' ? null : now();
+      run('UPDATE reports SET status=?,resolved_by=?,resolved_at=?,resolution_note=? WHERE id=?', status, status === 'open' ? null : admin.id, resolvedAt, status === 'open' ? '' : resolutionNote, report.id);
+      if (status !== 'open' && report.status === 'open') notify(report.reporter_id, 'report_update', 'A platform administrator reviewed your report.', '');
+      send(res, 200, { status, resolved_at: resolvedAt }); return true;
     }
     if (method === 'POST' && parts[1] === 'admin' && parts[2] === 'categories') {
       requireAdmin(req); const name = text(body.name, 40);
@@ -593,6 +737,10 @@ function createApp(options = {}) {
       send(res, status, { error: error instanceof HttpError ? error.message : 'Something went wrong. Please try again.' });
     }
   });
+  server.requestTimeout = 30_000;
+  server.headersTimeout = 35_000;
+  server.keepAliveTimeout = 5_000;
+  server.maxHeadersCount = 100;
   server.database = db;
   server.closeDatabase = () => db.close();
   server.appOptions = { dataDir, uploadDir, dbPath };
@@ -601,7 +749,8 @@ function createApp(options = {}) {
 
 if (require.main === module) {
   const port = Number(process.env.PORT || 3000);
-  const host = process.env.HOST || '127.0.0.1';
+  if (!Number.isInteger(port) || port < 1 || port > 65_535) throw new Error('PORT must be an integer between 1 and 65535.');
+  const host = process.env.HOST || (process.env.NODE_ENV === 'production' ? '0.0.0.0' : '127.0.0.1');
   const server = createApp();
   server.listen(port, host, () => {
     console.log(`Hometown Hub is listening on http://${host}:${port}`);

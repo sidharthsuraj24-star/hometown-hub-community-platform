@@ -141,3 +141,113 @@ test('invalid event dates and unapproved-community posting are rejected safely',
   const badEvent = await call(ctx, owner, '/api/events', 'POST', { community_id: id, title: 'Bad date', description: 'This event has an invalid date.', location: 'Town', starts_at: 'not-a-date', capacity: 'not-a-number' });
   assert.equal(badEvent.response.status, 400);
 });
+
+test('admin KPIs use observed activity and reports support contextual review and reopening', async t => {
+  const ctx = await fixture(t), admin = ctx.admin, owner = { cookie: '' }, member = { cookie: '' };
+  await loginAdmin(ctx, admin);
+  await register(ctx, owner, 'Community Owner', 'analytics-owner@example.test');
+  await register(ctx, member, 'Community Member', 'analytics-member@example.test');
+  const communityId = await createApprovedCommunity(ctx, owner, admin);
+  await joinAndApprove(ctx, member, owner, communityId);
+
+  const createdPost = await call(ctx, owner, '/api/posts', 'POST', { community_id: communityId, body: 'A real member-created update for the group.', category: 'General' });
+  assert.equal(createdPost.response.status, 201, JSON.stringify(createdPost.data));
+  const liked = await call(ctx, member, `/api/posts/${createdPost.data.id}/like`, 'POST', {});
+  assert.equal(liked.response.status, 200, JSON.stringify(liked.data));
+  const reportResult = await call(ctx, member, '/api/reports', 'POST', { target_type: 'post', target_id: createdPost.data.id, reason: 'This update needs a moderator to review its wording.' });
+  assert.equal(reportResult.response.status, 201, JSON.stringify(reportResult.data));
+
+  const eventResult = await call(ctx, owner, '/api/events', 'POST', { community_id: communityId, title: 'Local gathering', description: 'Meet neighbors at the town garden.', location: 'Town garden', starts_at: new Date(Date.now() + 86400000).toISOString(), capacity: 10 });
+  assert.equal(eventResult.response.status, 201, JSON.stringify(eventResult.data));
+  const rsvp = await call(ctx, member, `/api/events/${eventResult.data.id}/rsvp`, 'POST', { action: 'going' });
+  assert.equal(rsvp.response.status, 200, JSON.stringify(rsvp.data));
+
+  const dashboard = await call(ctx, admin, '/api/admin/dashboard');
+  assert.equal(dashboard.response.status, 200, JSON.stringify(dashboard.data));
+  const report = dashboard.data.reports.find(item => item.id === reportResult.data.id);
+  assert.ok(report);
+  assert.match(report.target_summary, /real member-created update/);
+  assert.match(report.target_context, /Hometown Circle/);
+  assert.match(report.target_link, new RegExp(communityId));
+  assert.equal(report.target_available, true);
+  const analytics = dashboard.data.analytics;
+  assert.equal(analytics.dau, 2, 'admin requests are excluded from member DAU');
+  assert.equal(analytics.active_users_7d, 2);
+  assert.equal(analytics.active_users_30d, 2);
+  assert.equal(analytics.engaged_users_30d, 2);
+  assert.equal(analytics.engagement_rate_30d, 100);
+  assert.equal(analytics.post_engagement_rate_30d, 100);
+  assert.equal(analytics.event_participation.going_rsvps, 1);
+  assert.equal(analytics.event_participation.eligible_member_event_pairs, 2);
+  assert.equal(analytics.event_participation.rate_percent, 50);
+  assert.equal(analytics.user_growth.current, 2);
+  assert.equal(analytics.user_growth.growth_percent, null, 'a zero previous-period baseline is not presented as a fabricated percentage');
+  assert.equal(analytics.community_growth.current, 1);
+  assert.equal(analytics.community_growth.growth_percent, null);
+  assert.equal(analytics.daily_active_trend.length, 30);
+  assert.equal(analytics.daily_active_trend.at(-1).active_users, 2);
+
+  const resolved = await call(ctx, admin, `/api/admin/reports/${report.id}/resolve`, 'POST', { status: 'resolved', resolution_note: 'Reviewed; action taken with the community moderator.' });
+  assert.equal(resolved.response.status, 200, JSON.stringify(resolved.data));
+  const afterResolve = await call(ctx, admin, '/api/admin/dashboard');
+  const closedReport = afterResolve.data.reports.find(item => item.id === report.id);
+  assert.equal(closedReport.status, 'resolved');
+  assert.equal(closedReport.resolution_note, 'Reviewed; action taken with the community moderator.');
+  assert.ok(closedReport.resolved_at);
+  const memberNotes = await call(ctx, member, '/api/notifications');
+  assert.ok(memberNotes.data.notifications.some(note => note.type === 'report_update'));
+
+  const reopened = await call(ctx, admin, `/api/admin/reports/${report.id}/resolve`, 'POST', { status: 'open' });
+  assert.equal(reopened.response.status, 200, JSON.stringify(reopened.data));
+  const afterReopen = await call(ctx, admin, '/api/admin/dashboard');
+  const openReport = afterReopen.data.reports.find(item => item.id === report.id);
+  assert.equal(openReport.status, 'open');
+  assert.equal(openReport.resolution_note, '');
+  assert.equal(openReport.resolved_at, null);
+
+  const invalidStatus = await call(ctx, admin, `/api/admin/reports/${report.id}/resolve`, 'POST', { status: 'deleted' });
+  assert.equal(invalidStatus.response.status, 400);
+  const unauthorized = await call(ctx, member, '/api/admin/dashboard');
+  assert.equal(unauthorized.response.status, 403);
+});
+
+test('existing report tables are migrated with the resolution-note field', async t => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hometown-hub-legacy-'));
+  const dbPath = path.join(dataDir, 'hometown-hub.sqlite');
+  const { DatabaseSync } = require('node:sqlite');
+  const legacy = new DatabaseSync(dbPath);
+  legacy.exec("CREATE TABLE users(id TEXT PRIMARY KEY); CREATE TABLE reports(id TEXT PRIMARY KEY,reporter_id TEXT NOT NULL REFERENCES users(id),target_type TEXT NOT NULL,target_id TEXT NOT NULL,reason TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'open',created_at TEXT NOT NULL,resolved_by TEXT REFERENCES users(id),resolved_at TEXT);");
+  legacy.close();
+  const server = createApp({ dataDir });
+  t.after(() => { server.closeDatabase(); fs.rmSync(dataDir, { recursive: true, force: true }); });
+  const columns = server.database.prepare('PRAGMA table_info(reports)').all().map(column => column.name);
+  assert.ok(columns.includes('resolution_note'));
+});
+
+test('production mode enables transport-security headers and Secure session cookies', async t => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hometown-hub-production-'));
+  const server = createApp({ dataDir, nodeEnv: 'production', adminEmail: 'prod-admin@example.test', adminPassword: 'production-admin-password-123' });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  const base = `http://127.0.0.1:${server.address().port}`;
+  t.after(async () => {
+    server.closeAllConnections();
+    await new Promise(resolve => server.close(resolve));
+    server.closeDatabase();
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  });
+  const health = await fetch(`${base}/api/health`);
+  assert.equal(health.status, 200);
+  assert.equal(health.headers.get('strict-transport-security'), 'max-age=63072000; includeSubDomains');
+  assert.equal(health.headers.get('x-frame-options'), 'DENY');
+  assert.match(health.headers.get('content-security-policy'), /default-src 'self'/);
+  const login = await fetch(`${base}/api/auth/login`, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Origin: base },
+    body: JSON.stringify({ email: 'prod-admin@example.test', password: 'production-admin-password-123' })
+  });
+  assert.equal(login.status, 200);
+  const cookie = login.headers.get('set-cookie');
+  assert.match(cookie, /HttpOnly/);
+  assert.match(cookie, /SameSite=Lax/);
+  assert.match(cookie, /Secure/);
+});

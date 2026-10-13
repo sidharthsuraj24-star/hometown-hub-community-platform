@@ -2,30 +2,38 @@
 
 ## Architecture
 
-- **Runtime:** Node.js 22.13+; tested in Node 24.19.
-- **HTTP/API:** Node built-in `http` server and JSON REST-style endpoints; no Express or third-party runtime package is required.
-- **Database:** built-in `node:sqlite`/SQLite with prepared statements, foreign keys, indexes, WAL mode, and a busy timeout.
+- **Runtime:** Node.js 22.13+; tested with Node 24.19.
+- **HTTP/API:** Node built-in `http` server and JSON REST-style endpoints; no third-party runtime package is required.
+- **Database:** built-in `node:sqlite`/SQLite with prepared statements, foreign keys, indexes, WAL mode, a busy timeout, and immediate transactions for capacity-limited RSVPs.
 - **Frontend:** vanilla JavaScript, semantic HTML, and responsive CSS served from `public/`.
-- **Uploads:** locally stored verified PNG/JPEG/WebP files under `DATA_DIR/uploads/` with randomized filenames and a 1.5 MB limit.
+- **Uploads:** locally stored verified PNG/JPEG/WebP files under `DATA_DIR/uploads/`, randomized filenames, 1.5 MB limit.
 - **Local persistence:** `DATA_DIR/hometown-hub.sqlite` (default `data/hometown-hub.sqlite`).
 
-The app is intentionally a single-process private-project prototype. It is not connected to a hosted database or deployment service.
+The app is a single-process private-project build. The included Docker/Compose configuration is intended for a persistent single-instance host; the app is not configured for Vercel/serverless or horizontal scaling.
 
 ## Run and configure
 
 ```sh
 cp .env.example .env
-# edit PLATFORM_ADMIN_EMAIL and PLATFORM_ADMIN_PASSWORD
+# Edit PLATFORM_ADMIN_EMAIL and PLATFORM_ADMIN_PASSWORD
 npm start
 ```
 
 - `PORT` — HTTP port (default `3000`).
-- `HOST` — listen interface (default `127.0.0.1`).
+- `HOST` — listen interface (default `127.0.0.1` for local development; `0.0.0.0` when `NODE_ENV=production` and `HOST` is unset).
 - `DATA_DIR` — database and uploads directory (default `./data`).
-- `PLATFORM_ADMIN_EMAIL` and `PLATFORM_ADMIN_PASSWORD` — on first startup, create a platform admin if both values are valid and that email does not already exist. Password minimum: 12 characters.
-- `NODE_ENV=production` — adds the `Secure` cookie attribute; HTTPS is required for that mode.
+- `PLATFORM_ADMIN_EMAIL` and `PLATFORM_ADMIN_PASSWORD` — on first startup, create a platform admin if both values are valid and the email does not already exist. Bootstrap password minimum: 12 characters.
+- `NODE_ENV=production` — enables the `Secure` session-cookie attribute and HSTS. Production requires an HTTPS reverse proxy or TLS termination.
 
-Configure the bootstrap email before registering it as a normal user. The bootstrap secret is not persisted in code; the resulting password is scrypt-hashed. If the account exists already, startup deliberately does not promote it or change its password.
+Configure the bootstrap email before registering it as a normal user. The bootstrap secret is not persisted in code; the resulting password is scrypt-hashed. If the account already exists, startup does not promote it or change its password.
+
+## Self-hosted container deployment
+
+- `Dockerfile` builds a small Node 24 image, runs as the unprivileged `node` user, exposes port 3000, and includes a health check.
+- `compose.yaml` sets production mode and persists both the SQLite database and uploads in the named `hometown-hub-data` volume.
+- `.dockerignore` excludes credentials, local data, and source-control files. GitHub Actions runs `npm run check` on Node 24 for pushes and pull requests to `main`.
+
+Start with `docker compose up --build -d` after creating and securely editing `.env`. Place the app behind HTTPS before using it outside a trusted private network. Back up the entire persistent volume consistently and test restoring the database and uploads together. A formal production security review, abuse operations, centralized logs/monitoring, and tested recovery plan remain deployment-owner responsibilities.
 
 ## Data model
 
@@ -36,10 +44,13 @@ Configure the bootstrap email before registering it as a normal user. The bootst
 | `memberships` | Per-community role and pending/active/rejected state. Composite primary key prevents duplicate membership requests. |
 | `posts` | Community feed content, kind, category, optional local image path, and pin state. |
 | `comments`, `likes`, `shares` | Post discussion and engagement; unique keys prevent duplicate likes/shares by a user. |
-| `events`, `rsvps` | Creator-managed event details, optional capacity, and each user's attendance state. |
-| `notifications` | In-app activity notification and read state. |
-| `reports` | Member-submitted content/user reports and platform resolution state. |
+| `events`, `rsvps` | Creator-managed event details, optional capacity, and each user's attendance intent. |
+| `notifications` | In-app activity notification and read state. No external delivery provider is configured. |
+| `reports` | Reporter, target, concern, open/resolved/dismissed status, reviewing administrator, timestamp, and private resolution note. |
+| `user_activity` | One UTC-day activity record per non-admin user. Rows older than 90 days are removed at startup. |
 | `content_categories`, `content_tags` | Platform-managed vocabulary; default entries are taxonomy only, not sample community records. |
+
+The `reports.resolution_note` field is added by a backward-compatible startup migration when opening an older database. Activity is recorded at daily granularity on authenticated requests, not with an external analytics service.
 
 ## API overview
 
@@ -56,22 +67,34 @@ All write routes accept JSON, use same-origin checks when an `Origin` header is 
 - `GET/POST /api/events`; `POST /api/events/:id/rsvp`; `DELETE /api/events/:id`
 - `GET /api/notifications`; `POST /api/notifications/read/:id` or `/read`
 - `POST /api/reports`
-- Admin: `GET /api/admin/dashboard`; review communities; change active member roles; enable/disable users; resolve reports; create/delete categories and tags.
+- Admin: `GET /api/admin/dashboard` (counts and analytics), community review, member role/access controls, report review, categories, and tags.
+- `POST /api/admin/reports/:id/resolve` accepts `status: open|resolved|dismissed` and an optional `resolution_note` (max 1,000 characters). Reopening clears the previous note and resolution timestamp; a closed report sends the reporter an in-app update.
+
+## KPI definitions and interpretation
+
+- **DAU / 7-day / 30-day active members:** distinct non-admin accounts with authenticated activity on one or more UTC days in the period.
+- **Engaged members (30d):** distinct active members with a post, comment, like, share, or going RSVP during the period; the engagement rate is engaged members divided by 30-day active members.
+- **Post engagement rate (30d):** posts created during the period with at least one like, comment, or share divided by all posts created during that period.
+- **Upcoming event RSVP rate:** going RSVPs for open future events created during the last 30 days divided by active member-event opportunities in those communities. This measures RSVP intent, **not verified attendance**.
+- **Member/community growth:** current-period records created in the last 30 days compared with records created in the preceding 30 days. Community counts include approved communities only. The percentage is omitted when the preceding count is zero.
+- **Daily activity chart:** one row per member/UTC day for the most recent 30 days.
+
+No records, events, active members, or impact values are seeded. Zero activity and insufficient historical baseline are represented as such rather than estimated.
 
 ## Event-capacity correctness
 
-The RSVP handler runs `BEGIN IMMEDIATE`, checks an existing RSVP and counts active `going` RSVPs, and writes the RSVP within the same transaction. If capacity is full, the entire transaction rolls back with HTTP `409`. This protects simultaneous requests handled by this SQLite database in the single-process configuration, which is covered by an integration test. A multi-instance deployment needs a shared transactional database and operational testing before it can claim the same behavior.
+The RSVP handler runs `BEGIN IMMEDIATE`, checks an existing RSVP and counts active `going` RSVPs, and writes the RSVP within the same transaction. If capacity is full, the entire transaction rolls back with HTTP `409`. A simultaneous-capacity integration test checks one-seat contention. A multi-instance deployment needs a shared transactional database and operational testing before it can claim the same behavior.
 
 ## Security controls and boundaries
 
-- Passwords use Node `scryptSync` with per-password random salts; comparisons use `timingSafeEqual`.
+- Passwords use Node `scryptSync` with per-password random salts; comparisons use `timingSafeEqual`. Sign-in responses are generic, and an unknown account still receives a dummy scrypt comparison.
 - Sessions are random, server-side in-memory tokens in `HttpOnly; SameSite=Lax` cookies. They expire after seven days and are invalidated on logout or admin disablement; process restart clears sessions.
-- Login and registration are throttled per remote address. This in-memory limiter is not shared across instances.
-- Writes reject cross-origin browser requests; JSON-only writes and SameSite cookies provide CSRF friction. This prototype has no user-managed email verification, account recovery, MFA, persistent session store, or formal security audit.
+- Login, registration, and report submissions are throttled per remote address. The limiter is in-memory and is not shared across app instances.
+- Writes reject cross-origin browser requests; JSON-only writes and SameSite cookies provide CSRF friction. This build has no email verification, account recovery, MFA, persistent session store, or formal security audit.
 - SQL values are parameterized. User-provided strings are length-bounded and HTML-escaped in the UI.
-- Security headers include a restrictive content policy, `X-Frame-Options`, and `X-Content-Type-Options`.
-- The prototype should not be exposed to public traffic without reviewing HTTPS/proxy behavior, rate-limits, spam controls, backups, abuse operations, logs, and multi-instance storage.
+- Security headers include a restrictive content policy, HSTS in production, frame/type protection, referrer policy, and permissions policy. Request and header timeouts and request-body limits are configured.
+- The app should not be exposed to public traffic without reviewing TLS/proxy behavior, shared rate-limiting/session requirements, backups, abuse operations, logs, privacy notices, and multi-instance storage.
 
 ## Verification
 
-Run `npm test` for API integration coverage, including the simultaneous capacity-one RSVP race. `npm run check` also runs Node syntax checks. Tests use temporary SQLite databases and do not create repository seed data.
+Run `npm run check` for JavaScript syntax checks and API integration tests, including registration, community approval/member roles, image access controls, concurrent RSVP capacity enforcement, data-derived KPI calculations, private report notes/reopening, and report-schema migration. Tests use temporary SQLite databases and do not create repository seed data.

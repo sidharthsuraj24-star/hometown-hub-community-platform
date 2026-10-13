@@ -1,0 +1,13 @@
+.git
+.gitignore
+.env
+.env.*
+!.env.example
+node_modules
+npm-debug.log*
+coverage
+data
+uploads
+*.sqlite
+*.sqlite-shm
+*.sqlite-wal

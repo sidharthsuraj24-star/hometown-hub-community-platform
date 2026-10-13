@@ -47,7 +47,10 @@ Hometown Hub gives people a focused digital home for community updates and parti
 - Community rules/guidelines, moderation actions, and an administrator dashboard.
 - Abuse reports for users, posts, comments, and communities.
 - Platform-managed post categories and community tags.
+- Platform-admin report review with target context, private notes, resolve/dismiss/reopen actions, and in-app status updates to reporters.
+- Database-derived DAU, rolling active-member, post engagement, upcoming-event RSVP, member/community growth metrics, and a 30-day activity chart.
 - PRD, technical documentation, automated API tests, and a local run configuration.
+- Non-root Docker/Compose deployment files and GitHub Actions CI for a persistent single-instance host.
 
 ### Excluded
 
@@ -75,12 +78,14 @@ Hometown Hub gives people a focused digital home for community updates and parti
 | N1 | Receive in-app notifications | Relevant community activity creates notification records; users can mark them read. No external push delivery is claimed. |
 | M1 | Manage membership and guidelines | Moderators can review membership requests and change community guidelines. |
 | A1 | Platform operations | Admin panel shows database-derived counts and provides community, account, moderator, report, category, and tag controls. |
+| A2 | Measure community activity | Admin analytics derive DAU, rolling active members, engagement, event RSVP intent, and growth from actual records; no synthetic activity is used. |
 
 ## 6. Safety, privacy, and content principles
 
 - Do not seed fake members, news, events, businesses, services, alerts, or community impact statistics.
 - Keep new community requests non-public until approval.
 - Store authentication passwords only as scrypt hashes and keep uploaded files and SQLite data out of Git.
+- Record activity at UTC-day granularity for analytics and delete activity rows older than 90 days at startup; do not send product analytics to a third party.
 - Use same-site HTTP-only session cookies, same-origin checks on browser writes, login/registration throttling, restrictive security headers, input-size limits, and parameterized SQL statements.
 - Tell users what profile details are visible and encourage careful sharing.
 - Human moderators/admins handle content reports; the system does not promise automated detection or dispute adjudication.
@@ -97,7 +102,9 @@ The supplied brief lists “Pandit onboarding module” as a deliverable and “
 
 ## 8. Success measurement
 
-The dashboard currently reports simple counts derived from stored project records (accounts, approved/pending communities, posts, upcoming events, and open reports). It does not seed data or calculate DAU, conversion, growth, or impact. Those KPIs require an agreed analytics/privacy policy and sufficient real usage; no values are claimed in this prototype.
+The admin dashboard calculates DAU and rolling active members from authenticated member activity, engagement from recorded posts/interactions, upcoming-event RSVP intent from active member-event opportunities, and 30-day user/community growth from creation dates. Definitions and limits are documented in `TECHNICAL.md`; the dashboard never seeds or estimates activity. Growth percentages are not shown when the prior period is zero. Event RSVPs are not verified attendance. The 90-day daily activity records are used for these aggregate views and are not sent to an external analytics provider.
+
+The supplied brief sets a page-load target under three seconds. That target, production traffic capacity, concurrent-user scalability, and availability have **not** been measured in a production-like environment and are not claimed by the Phase 1 build. The container configuration is deployment-ready for a persistent single-instance host but is not a production release, cloud-managed database, or multi-instance architecture.
 
 ## 9. Future candidates (not implemented)
 
