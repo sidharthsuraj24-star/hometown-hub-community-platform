@@ -225,6 +225,106 @@ test('admin KPIs use observed activity and reports support contextual review and
   assert.equal(unauthorized.response.status, 403);
 });
 
+test('community moderators manage guidelines and event hosts can edit or cancel events safely', async t => {
+  const ctx = await fixture(t), admin = ctx.admin, owner = { cookie: '' }, member = { cookie: '' }, second = { cookie: '' }, outsider = { cookie: '' };
+  await loginAdmin(ctx, admin);
+  await register(ctx, owner, 'Community Owner', 'manage-owner@example.test');
+  await register(ctx, member, 'Community Member', 'manage-member@example.test');
+  await register(ctx, second, 'Second Community Member', 'manage-second@example.test');
+  await register(ctx, outsider, 'Non-member', 'manage-outsider@example.test');
+  const communityId = await createApprovedCommunity(ctx, owner, admin);
+  await joinAndApprove(ctx, member, owner, communityId);
+  await joinAndApprove(ctx, second, owner, communityId);
+
+  const savedRules = await call(ctx, owner, `/api/communities/${communityId}/rules`, 'POST', { rules: 'Be welcoming. Protect personal details. Keep local discussions relevant.' });
+  assert.equal(savedRules.response.status, 200);
+  const detail = await call(ctx, member, `/api/communities/${communityId}`);
+  assert.equal(detail.data.community.rules, 'Be welcoming. Protect personal details. Keep local discussions relevant.');
+  const deniedRules = await call(ctx, member, `/api/communities/${communityId}/rules`, 'POST', { rules: 'Member cannot change these.' });
+  assert.equal(deniedRules.response.status, 403);
+  const memberNotes = await call(ctx, member, '/api/notifications');
+  assert.ok(memberNotes.data.notifications.some(note => note.type === 'community_rules'));
+
+  const created = await call(ctx, owner, '/api/events', 'POST', { community_id: communityId, title: 'Garden gathering', description: 'Meet and plan the community garden.', location: 'Town garden', starts_at: new Date(Date.now() + 86400000).toISOString(), capacity: 2 });
+  assert.equal(created.response.status, 201, JSON.stringify(created.data));
+  const eventId = created.data.id;
+  const deniedEdit = await call(ctx, outsider, `/api/events/${eventId}`, 'PATCH', { title: 'Unauthorized change' });
+  assert.equal(deniedEdit.response.status, 403);
+  const rsvp = await call(ctx, member, `/api/events/${eventId}/rsvp`, 'POST', { action: 'going' });
+  assert.equal(rsvp.response.status, 200);
+  const secondRsvp = await call(ctx, second, `/api/events/${eventId}/rsvp`, 'POST', { action: 'going' });
+  assert.equal(secondRsvp.response.status, 200);
+  const tooSmall = await call(ctx, owner, `/api/events/${eventId}`, 'PATCH', { capacity: 0 });
+  assert.equal(tooSmall.response.status, 400);
+  const belowAttendance = await call(ctx, owner, `/api/events/${eventId}`, 'PATCH', { capacity: 1 });
+  assert.equal(belowAttendance.response.status, 409);
+  const validEdit = await call(ctx, owner, `/api/events/${eventId}`, 'PATCH', { title: 'Garden planning afternoon', description: 'Meet and organize the upcoming planting day.', location: 'Riverside community garden', starts_at: new Date(Date.now() + 172800000).toISOString(), capacity: 2 });
+  assert.equal(validEdit.response.status, 200, JSON.stringify(validEdit.data));
+  assert.equal(validEdit.data.event.title, 'Garden planning afternoon');
+  const attendeeNotes = await call(ctx, member, '/api/notifications');
+  assert.ok(attendeeNotes.data.notifications.some(note => note.type === 'event_update' && /details changed/i.test(note.message)));
+
+  const cancelled = await call(ctx, owner, `/api/events/${eventId}`, 'DELETE', {});
+  assert.equal(cancelled.response.status, 200);
+  const cancelNotes = await call(ctx, member, '/api/notifications');
+  assert.ok(cancelNotes.data.notifications.some(note => note.type === 'event_update' && /cancelled/i.test(note.message)));
+  const cancelledRsvp = await call(ctx, member, `/api/events/${eventId}/rsvp`, 'POST', { action: 'going' });
+  assert.equal(cancelledRsvp.response.status, 404);
+});
+
+test('reporters can track cases, exchange public updates, and appeal while private admin notes stay private', async t => {
+  const ctx = await fixture(t), admin = ctx.admin, reporter = { cookie: '' }, other = { cookie: '' };
+  await loginAdmin(ctx, admin);
+  const reporterUser = await register(ctx, reporter, 'Reporting Member', 'reporter-case@example.test');
+  await register(ctx, other, 'Other Member', 'other-case@example.test');
+  const reported = await call(ctx, reporter, '/api/reports', 'POST', { target_type: 'user', target_id: reporterUser.id, reason: 'Please review this account for a possible impersonation concern.' });
+  assert.equal(reported.response.status, 201, JSON.stringify(reported.data));
+  const reportId = reported.data.id;
+  const adminAlerts = await call(ctx, admin, '/api/notifications');
+  assert.ok(adminAlerts.data.notifications.some(note => note.type === 'report_case'));
+
+  const ownCases = await call(ctx, reporter, '/api/reports');
+  assert.equal(ownCases.response.status, 200);
+  assert.equal(ownCases.data.reports.length, 1);
+  assert.equal(ownCases.data.reports[0].status, 'open');
+  assert.equal(Object.hasOwn(ownCases.data.reports[0], 'resolution_note'), false);
+  assert.equal(ownCases.data.reports[0].history.length, 1);
+  assert.equal((await call(ctx, other, '/api/reports')).data.reports.length, 0);
+  assert.equal((await call(ctx, other, `/api/reports/${reportId}/messages`, 'POST', { message: 'This should not access another member case.' })).response.status, 404);
+
+  const unauthorizedAdminReply = await call(ctx, reporter, `/api/admin/reports/${reportId}/messages`, 'POST', { message: 'Unauthorized response.' });
+  assert.equal(unauthorizedAdminReply.response.status, 403);
+  const review = await call(ctx, admin, `/api/admin/reports/${reportId}/resolve`, 'POST', { status: 'in_review', response: 'We have started reviewing the information you sent.', resolution_note: 'This note must remain private.' });
+  assert.equal(review.response.status, 200, JSON.stringify(review.data));
+  const inReview = await call(ctx, reporter, '/api/reports');
+  assert.equal(inReview.data.reports[0].status, 'in_review');
+  assert.ok(inReview.data.reports[0].messages.some(message => message.author_role === 'admin' && /started reviewing/.test(message.body)));
+  const privateAtReview = await call(ctx, admin, '/api/admin/dashboard');
+  assert.equal(privateAtReview.data.reports.find(item => item.id === reportId).resolution_note, 'This note must remain private.');
+
+  const followUp = await call(ctx, reporter, `/api/reports/${reportId}/messages`, 'POST', { message: 'I can provide more context about the account and the concern.' });
+  assert.equal(followUp.response.status, 201, JSON.stringify(followUp.data));
+  const followUpAlerts = await call(ctx, admin, '/api/notifications');
+  assert.ok(followUpAlerts.data.notifications.some(note => note.type === 'report_update'));
+  const resolved = await call(ctx, admin, `/api/admin/reports/${reportId}/resolve`, 'POST', { status: 'resolved', resolution_note: 'Reviewed the submitted context; no further action was taken.', response: 'Review is complete. Thank you for the additional context.' });
+  assert.equal(resolved.response.status, 200);
+  const closedCase = (await call(ctx, reporter, '/api/reports')).data.reports[0];
+  assert.equal(closedCase.status, 'resolved');
+  assert.equal(Object.hasOwn(closedCase, 'resolution_note'), false);
+  assert.ok(closedCase.messages.some(message => /Review is complete/.test(message.body)));
+
+  const appeal = await call(ctx, reporter, `/api/reports/${reportId}/messages`, 'POST', { message: 'I am requesting another review because relevant context was missed.' });
+  assert.equal(appeal.response.status, 201);
+  assert.equal(appeal.data.status, 'open');
+  const reopened = (await call(ctx, reporter, '/api/reports')).data.reports[0];
+  assert.equal(reopened.status, 'open');
+  assert.equal(reopened.resolved_at, null);
+  assert.ok(reopened.history.some(item => item.from_status === 'resolved' && item.to_status === 'open'));
+  const adminCase = (await call(ctx, admin, '/api/admin/dashboard')).data.reports.find(item => item.id === reportId);
+  assert.equal(adminCase.resolution_note, '');
+  assert.ok(adminCase.messages.some(message => /requesting another review/.test(message.body)));
+});
+
 test('existing report tables are migrated with the resolution-note field', async t => {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hometown-hub-legacy-'));
   const dbPath = path.join(dataDir, 'hometown-hub.sqlite');
@@ -236,6 +336,9 @@ test('existing report tables are migrated with the resolution-note field', async
   t.after(() => { server.closeDatabase(); fs.rmSync(dataDir, { recursive: true, force: true }); });
   const columns = server.database.prepare('PRAGMA table_info(reports)').all().map(column => column.name);
   assert.ok(columns.includes('resolution_note'));
+  const tables = server.database.prepare("SELECT name FROM sqlite_master WHERE type='table'").all().map(row => row.name);
+  assert.ok(tables.includes('report_messages'));
+  assert.ok(tables.includes('report_status_history'));
 });
 
 test('production mode enables transport-security headers and Secure session cookies', async t => {

@@ -29,9 +29,9 @@ Hometown Hub gives people a focused digital home for community updates and parti
 | Role | Capabilities |
 |---|---|
 | Visitor | View the sign-in/registration screen. Approved community listings are available after sign-in in this Phase 1 implementation. |
-| Member | Maintain a profile; discover communities; request membership; contribute posts and comments; like/share posts; create or RSVP to events; submit reports. |
-| Community moderator | Member capabilities plus approve/reject join requests, edit guidelines, pin posts, remove posts/comments, and manage community events. Community creators are moderators of their submitted community. |
-| Platform administrator | Review new communities, enable/disable member accounts, assign/remove community moderators, process reports, and manage category/tag vocabularies. |
+| Member | Maintain a profile; discover communities; request membership; contribute posts and comments; like/share posts; create or RSVP to events; submit reports, track their status, send follow-ups, and ask to reopen a closed case. |
+| Community moderator | Member capabilities plus approve/reject join requests, edit guidelines, pin posts, remove posts/comments, and edit or cancel community events. Community creators are moderators of their submitted community. |
+| Platform administrator | Review new communities, enable/disable member accounts, assign/remove community moderators, triage reports, exchange reporter-visible updates while keeping internal notes private, and manage category/tag vocabularies. |
 
 ## 4. Phase 1 scope
 
@@ -41,13 +41,13 @@ Hometown Hub gives people a focused digital home for community updates and parti
 - Account registration, sign-in, and profile with name, hometown/region, and short bio.
 - Community creation requests, platform approval, directory, and join-request workflow.
 - Community feed with text posts, optional images, categories, announcements, comments, likes, share links, and moderator pinning/removal.
-- Events created by community members, including event details and creator-defined optional capacity.
+- Events created by community members, including event details and creator-defined optional capacity; creators and moderators can edit or cancel events, and RSVP members are notified about changes/cancellations.
 - Concurrent RSVP enforcement: a capacity-limited event never accepts more active RSVPs than its stated capacity in the tested single-process deployment.
-- In-app notifications for membership actions, community review, new posts/events, comments, and likes.
-- Community rules/guidelines, moderation actions, and an administrator dashboard.
-- Abuse reports for users, posts, comments, and communities.
+- In-app notifications for membership actions, community review, new posts/events and event changes, comments, likes, guideline changes, and report filing/status/follow-up.
+- Community rules/guidelines editable by moderators, with in-app notices to active members when rules change; moderation actions and an administrator dashboard.
+- Abuse reports for users, posts, comments, and communities, with reporter case tracking, message exchange, status history, appeal/reopen, and admin-only private notes.
 - Platform-managed post categories and community tags.
-- Platform-admin report review with target context, private notes, resolve/dismiss/reopen actions, and in-app status updates to reporters.
+- Platform-admin report review with target context, open/in-review/resolved/dismissed states, reporter-visible responses, private admin notes, status history, and in-app case alerts/updates.
 - Database-derived DAU, rolling active-member, post engagement, upcoming-event RSVP, member/community growth metrics, and a 30-day activity chart.
 - PRD, technical documentation, automated API tests, and a local run configuration.
 - Non-root Docker/Compose deployment files and GitHub Actions CI for a persistent single-instance host.
@@ -73,12 +73,13 @@ Hometown Hub gives people a focused digital home for community updates and parti
 | P1 | Post text, image, announcement | Active members can share posts. Optional images are verified PNG/JPEG/WebP files up to 1.5 MB. |
 | P2 | Engage with posts | Members can like, comment, and copy/share an in-app deep link. Moderators can pin posts. |
 | P3 | Moderate posts/comments | Authors can remove their own content; community moderators can remove content in their community. |
-| E1 | Create/manage events | Active community members can create events; event creators and moderators can cancel them. |
+| E1 | Create/manage events | Active community members can create events; creators and moderators can edit or cancel them. Edits that would reduce capacity below active RSVPs are rejected; attendees are notified of event changes or cancellation. |
 | E2 | RSVP safely | RSVP uses an SQLite immediate transaction to check capacity and insert/update attendance atomically. A simultaneous-capacity integration test checks one-seat contention. |
 | N1 | Receive in-app notifications | Relevant community activity creates notification records; users can mark them read. No external push delivery is claimed. |
-| M1 | Manage membership and guidelines | Moderators can review membership requests and change community guidelines. |
+| M1 | Manage membership and guidelines | Moderators can review membership requests and change community guidelines; active members receive an in-app notice when guidelines change. |
 | A1 | Platform operations | Admin panel shows database-derived counts and provides community, account, moderator, report, category, and tag controls. |
 | A2 | Measure community activity | Admin analytics derive DAU, rolling active members, engagement, event RSVP intent, and growth from actual records; no synthetic activity is used. |
+| A3 | Resolve reports and disputes | Reporters can view their own cases, exchange visible follow-up messages, and request reopening after closure. Admins can mark a case open/in review/resolved/dismissed, send a visible response, and retain a separate private note; status changes are recorded. |
 
 ## 6. Safety, privacy, and content principles
 
@@ -88,7 +89,7 @@ Hometown Hub gives people a focused digital home for community updates and parti
 - Record activity at UTC-day granularity for analytics and delete activity rows older than 90 days at startup; do not send product analytics to a third party.
 - Use same-site HTTP-only session cookies, same-origin checks on browser writes, login/registration throttling, restrictive security headers, input-size limits, and parameterized SQL statements.
 - Tell users what profile details are visible and encourage careful sharing.
-- Human moderators/admins handle content reports; the system does not promise automated detection or dispute adjudication.
+- Human moderators/admins handle content reports; reporter-facing status and messaging support the process but do not promise automated detection or dispute adjudication. Internal admin notes are not shown to reporters.
 
 ## 7. Product decisions and open question
 

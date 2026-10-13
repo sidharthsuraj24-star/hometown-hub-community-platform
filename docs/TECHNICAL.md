@@ -44,9 +44,11 @@ Start with `docker compose up --build -d` after creating and securely editing `.
 | `memberships` | Per-community role and pending/active/rejected state. Composite primary key prevents duplicate membership requests. |
 | `posts` | Community feed content, kind, category, optional local image path, and pin state. |
 | `comments`, `likes`, `shares` | Post discussion and engagement; unique keys prevent duplicate likes/shares by a user. |
-| `events`, `rsvps` | Creator-managed event details, optional capacity, and each user's attendance intent. |
+| `events`, `rsvps` | Creator/moderator-managed event details, optional capacity, and each user's attendance intent. Existing going RSVPs bound capacity reductions; event changes/cancellations notify going attendees. |
 | `notifications` | In-app activity notification and read state. No external delivery provider is configured. |
-| `reports` | Reporter, target, concern, open/resolved/dismissed status, reviewing administrator, timestamp, and private resolution note. |
+| `reports` | Reporter, target, concern, open/in-review/resolved/dismissed status, reviewing administrator, timestamp, and private resolution note. |
+| `report_messages` | Reporter/admin conversation visible to the reporter and platform administrators; internal notes stay in `reports.resolution_note`. |
+| `report_status_history` | Append-only actor/time record for report status transitions, visible in the reporter case view and admin review. |
 | `user_activity` | One UTC-day activity record per non-admin user. Rows older than 90 days are removed at startup. |
 | `content_categories`, `content_tags` | Platform-managed vocabulary; default entries are taxonomy only, not sample community records. |
 
@@ -64,11 +66,11 @@ All write routes accept JSON, use same-origin checks when an `Origin` header is 
 - `GET /api/communities/:id/requests`
 - `GET /api/feed?community=:id`; `POST /api/posts`
 - `POST /api/posts/:id/comments`, `/like`, `/share`, `/pin`; `DELETE /api/posts/:id`, `/api/comments/:id`
-- `GET/POST /api/events`; `POST /api/events/:id/rsvp`; `DELETE /api/events/:id`
+- `GET/POST /api/events`; `PATCH /api/events/:id` for creator/moderator edits; `POST /api/events/:id/rsvp`; `DELETE /api/events/:id` cancels and notifies going attendees
 - `GET /api/notifications`; `POST /api/notifications/read/:id` or `/read`
-- `POST /api/reports`
+- `POST /api/reports`; `GET /api/reports` lists only the signed-in reporter's cases; `POST /api/reports/:id/messages` adds reporter follow-up and reopens a resolved/dismissed case.
 - Admin: `GET /api/admin/dashboard` (counts and analytics), community review, member role/access controls, report review, categories, and tags.
-- `POST /api/admin/reports/:id/resolve` accepts `status: open|resolved|dismissed` and an optional `resolution_note` (max 1,000 characters). Reopening clears the previous note and resolution timestamp; a closed report sends the reporter an in-app update.
+- `POST /api/admin/reports/:id/resolve` accepts `status: open|in_review|resolved|dismissed`, an optional private `resolution_note` (max 1,000 characters), and optional reporter-visible `response` text. `POST /api/admin/reports/:id/messages` sends a case reply without changing status. Reopening clears the current private note/resolution timestamp; status changes are retained in `report_status_history` and reporters receive in-app updates.
 
 ## KPI definitions and interpretation
 
@@ -97,4 +99,4 @@ The RSVP handler runs `BEGIN IMMEDIATE`, checks an existing RSVP and counts acti
 
 ## Verification
 
-Run `npm run check` for JavaScript syntax checks and API integration tests, including registration, community approval/member roles, image access controls, concurrent RSVP capacity enforcement, data-derived KPI calculations, private report notes/reopening, and report-schema migration. Tests use temporary SQLite databases and do not create repository seed data.
+Run `npm run check` for JavaScript syntax checks and API integration tests, including registration, community approval/member roles, image access controls, guideline authorization and notifications, event edit/cancel permissions, RSVP capacity enforcement and attendee notifications, data-derived KPI calculations, reporter case tracking/appeals, public case messages versus private admin notes, report status history, and report-schema migration. Tests use temporary SQLite databases and do not create repository seed data.

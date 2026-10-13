@@ -115,6 +115,15 @@ function createApp(options = {}) {
       created_at TEXT NOT NULL, resolved_by TEXT REFERENCES users(id), resolved_at TEXT,
       resolution_note TEXT NOT NULL DEFAULT ''
     );
+    CREATE TABLE IF NOT EXISTS report_messages (
+      id TEXT PRIMARY KEY, report_id TEXT NOT NULL REFERENCES reports(id) ON DELETE CASCADE,
+      author_id TEXT NOT NULL REFERENCES users(id), body TEXT NOT NULL, created_at TEXT NOT NULL
+    );
+    CREATE TABLE IF NOT EXISTS report_status_history (
+      id TEXT PRIMARY KEY, report_id TEXT NOT NULL REFERENCES reports(id) ON DELETE CASCADE,
+      actor_id TEXT NOT NULL REFERENCES users(id), from_status TEXT NOT NULL, to_status TEXT NOT NULL,
+      created_at TEXT NOT NULL
+    );
     CREATE TABLE IF NOT EXISTS user_activity (
       user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
       activity_day TEXT NOT NULL, last_seen_at TEXT NOT NULL,
@@ -128,6 +137,8 @@ function createApp(options = {}) {
     CREATE INDEX IF NOT EXISTS idx_events_community_start ON events(community_id, starts_at);
     CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id, created_at DESC);
     CREATE INDEX IF NOT EXISTS idx_reports_status ON reports(status, created_at DESC);
+    CREATE INDEX IF NOT EXISTS idx_report_messages_case ON report_messages(report_id, created_at);
+    CREATE INDEX IF NOT EXISTS idx_report_history_case ON report_status_history(report_id, created_at);
     CREATE INDEX IF NOT EXISTS idx_activity_day ON user_activity(activity_day, user_id);
     CREATE INDEX IF NOT EXISTS idx_comments_post_created ON comments(post_id, created_at);
     CREATE INDEX IF NOT EXISTS idx_rsvps_event_status ON rsvps(event_id, status);
@@ -231,6 +242,13 @@ function createApp(options = {}) {
     const created = now();
     const stmt = db.prepare('INSERT INTO notifications(id,user_id,type,message,link,created_at) VALUES(?,?,?,?,?,?)');
     for (const member of members) stmt.run(uuid(), member.user_id, type, text(message, 240), text(link, 500), created);
+  }
+  function notifyEventAttendees(eventId, excludeUserId, message) {
+    const attendees = many("SELECT user_id FROM rsvps WHERE event_id=? AND status='going' AND user_id<>?", eventId, excludeUserId || '');
+    for (const attendee of attendees) notify(attendee.user_id, 'event_update', message, `/?event=${eventId}`);
+  }
+  function notifyAdmins(type, message) {
+    for (const admin of many("SELECT id FROM users WHERE role='admin' AND disabled=0")) notify(admin.id, type, message, '');
   }
   async function readBody(req) {
     const chunks = [];
@@ -379,6 +397,16 @@ function createApp(options = {}) {
     }
     return { target_summary: text(summary, 1000), target_context: text(context, 1200), target_link: link, target_available: Boolean(target) };
   }
+  function reportMessages(reportId) {
+    return many('SELECT m.id,m.body,m.created_at,u.id AS author_id,u.name AS author_name,u.role AS author_role FROM report_messages m JOIN users u ON u.id=m.author_id WHERE m.report_id=? ORDER BY m.created_at ASC', reportId);
+  }
+  function reportStatusHistory(reportId) {
+    return many('SELECT h.from_status,h.to_status,h.created_at,u.name AS actor_name,u.role AS actor_role FROM report_status_history h JOIN users u ON u.id=h.actor_id WHERE h.report_id=? ORDER BY h.created_at ASC', reportId);
+  }
+  function recordReportStatus(reportId, actorId, fromStatus, toStatus) {
+    if (fromStatus === toStatus) return;
+    run('INSERT INTO report_status_history(id,report_id,actor_id,from_status,to_status,created_at) VALUES(?,?,?,?,?,?)', uuid(), reportId, actorId, fromStatus, toStatus, now());
+  }
 
   async function api(req, res, url) {
     const method = req.method;
@@ -462,7 +490,9 @@ function createApp(options = {}) {
     }
     if (method === 'POST' && parts[1] === 'communities' && parts[2] && parts[3] === 'rules') {
       const user = requireUser(req), id = parts[2]; requireModerator(id, user);
-      const rules = text(body.rules, 3000); run('UPDATE communities SET rules=? WHERE id=?', rules, id);
+      const rules = text(body.rules, 3000), previous = one('SELECT rules,name FROM communities WHERE id=?', id);
+      run('UPDATE communities SET rules=? WHERE id=?', rules, id);
+      if (previous && previous.rules !== rules) notifyMembers(id, user.id, 'community_rules', `Community guidelines were updated for ${previous.name}.`, `/?community=${id}`);
       send(res, 200, { rules }); return true;
     }
     if (method === 'GET' && parts[1] === 'communities' && parts[2] && parts[3] === 'requests') {
@@ -580,6 +610,35 @@ function createApp(options = {}) {
       notifyMembers(communityId, user.id, 'event', `${user.name} created an event in ${community.name}: ${title}.`, `/?event=${id}`);
       send(res, 201, { id }); return true;
     }
+    if (method === 'PATCH' && parts[1] === 'events' && parts[2]) {
+      const user = requireUser(req), event = one('SELECT * FROM events WHERE id=?', parts[2]);
+      if (!event) fail(404, 'Event not found.');
+      if (event.created_by !== user.id) requireModerator(event.community_id, user);
+      if (event.status !== 'open') fail(409, 'Only open events can be edited.');
+      const title = body.title === undefined ? event.title : text(body.title, 120);
+      const description = body.description === undefined ? event.description : text(body.description, 1500);
+      const location = body.location === undefined ? event.location : text(body.location, 160);
+      const startsAtInput = body.starts_at === undefined ? event.starts_at : body.starts_at;
+      const eventDate = new Date(startsAtInput);
+      if (typeof startsAtInput !== 'string' || !Number.isFinite(eventDate.getTime())) fail(400, 'Enter a valid event date and time.');
+      const startsAt = eventDate.toISOString();
+      if (eventDate.getTime() <= Date.now()) fail(400, 'Choose a future event date and time.');
+      if (title.length < 3 || description.length < 10 || location.length < 2) fail(400, 'Add an event title, description, and location.');
+      let capacity = event.capacity;
+      if (body.capacity !== undefined) {
+        if (body.capacity === '' || body.capacity == null) capacity = null;
+        else {
+          capacity = safeInt(body.capacity);
+          if (capacity === null || capacity < 1 || capacity > 100000) fail(400, 'Capacity must be a whole number between 1 and 100,000, or left blank.');
+        }
+      }
+      const going = one("SELECT COUNT(*) AS n FROM rsvps WHERE event_id=? AND status='going'", event.id).n;
+      if (capacity !== null && capacity < going) fail(409, `Capacity cannot be lower than the ${going} existing going RSVP${going === 1 ? '' : 's'}.`);
+      const changed = title !== event.title || description !== event.description || location !== event.location || startsAt !== event.starts_at || capacity !== event.capacity;
+      run('UPDATE events SET title=?,description=?,location=?,starts_at=?,capacity=? WHERE id=?', title, description, location, startsAt, capacity, event.id);
+      if (changed) notifyEventAttendees(event.id, user.id, `Event details changed: ${title}.`);
+      send(res, 200, { ok: true, event: { ...event, title, description, location, starts_at: startsAt, capacity } }); return true;
+    }
     if (method === 'POST' && parts[1] === 'events' && parts[2] && parts[3] === 'rsvp') {
       const user = requireUser(req), eventId = parts[2], action = body.action;
       const event = one("SELECT * FROM events WHERE id=? AND status='open'", eventId); if (!event) fail(404, 'Open event not found.');
@@ -601,7 +660,10 @@ function createApp(options = {}) {
     if (method === 'DELETE' && parts[1] === 'events' && parts[2]) {
       const user = requireUser(req), event = one('SELECT * FROM events WHERE id=?', parts[2]); if (!event) fail(404, 'Event not found.');
       if (event.created_by !== user.id) requireModerator(event.community_id, user);
-      run("UPDATE events SET status='cancelled' WHERE id=?", event.id); send(res, 200, { ok: true }); return true;
+      if (event.status === 'cancelled') fail(409, 'This event is already cancelled.');
+      run("UPDATE events SET status='cancelled' WHERE id=?", event.id);
+      notifyEventAttendees(event.id, user.id, `Event cancelled: ${event.title}.`);
+      send(res, 200, { ok: true }); return true;
     }
 
     if (method === 'GET' && parts[1] === 'notifications') {
@@ -615,14 +677,38 @@ function createApp(options = {}) {
       send(res, 200, { ok: true }); return true;
     }
 
-    if (method === 'POST' && parts[1] === 'reports') {
+    if (method === 'GET' && parts[1] === 'reports' && parts.length === 2) {
+      const user = requireUser(req);
+      const reports = many('SELECT * FROM reports WHERE reporter_id=? ORDER BY created_at DESC LIMIT 100', user.id).map(report => {
+        const { resolution_note, resolved_by, ...reporterReport } = report;
+        return { ...reporterReport, ...reportTargetInfo(report), messages: reportMessages(report.id), history: reportStatusHistory(report.id) };
+      });
+      send(res, 200, { reports }); return true;
+    }
+    if (method === 'POST' && parts[1] === 'reports' && parts.length === 2) {
       rateLimit(req, 'report');
       const user = requireUser(req), targetType = text(body.target_type, 20), targetId = text(body.target_id, 64), reason = text(body.reason, 1000);
       if (!['user', 'post', 'comment', 'community'].includes(targetType) || !targetId || reason.length < 10) fail(400, 'Choose content to report and describe the issue in at least 10 characters.');
       const exists = targetType === 'user' ? one('SELECT id FROM users WHERE id=?', targetId) : targetType === 'post' ? one('SELECT id FROM posts WHERE id=?', targetId) : targetType === 'comment' ? one('SELECT id FROM comments WHERE id=?', targetId) : one('SELECT id FROM communities WHERE id=?', targetId);
       if (!exists) fail(404, 'The reported item was not found.');
       const id = uuid(); run('INSERT INTO reports(id,reporter_id,target_type,target_id,reason,created_at) VALUES(?,?,?,?,?,?)', id, user.id, targetType, targetId, reason, now());
+      recordReportStatus(id, user.id, '', 'open');
+      notifyAdmins('report_case', 'A member submitted a report that is ready for review.');
       send(res, 201, { id }); return true;
+    }
+    if (method === 'POST' && parts[1] === 'reports' && parts[2] && parts[3] === 'messages') {
+      rateLimit(req, 'report_message');
+      const user = requireUser(req), report = one('SELECT * FROM reports WHERE id=? AND reporter_id=?', parts[2], user.id);
+      if (!report) fail(404, 'Report not found.');
+      const message = text(body.message, 1500);
+      if (message.length < 10) fail(400, 'Add at least 10 characters of useful information.');
+      if (report.status === 'resolved' || report.status === 'dismissed') {
+        run("UPDATE reports SET status='open',resolved_by=NULL,resolved_at=NULL,resolution_note='' WHERE id=?", report.id);
+        recordReportStatus(report.id, user.id, report.status, 'open');
+      }
+      run('INSERT INTO report_messages(id,report_id,author_id,body,created_at) VALUES(?,?,?,?,?)', uuid(), report.id, user.id, message, now());
+      notifyAdmins('report_update', 'A reporter added information to a case.');
+      send(res, 201, { status: report.status === 'resolved' || report.status === 'dismissed' ? 'open' : report.status }); return true;
     }
 
     if (method === 'GET' && parts[1] === 'admin' && parts[2] === 'dashboard') {
@@ -633,11 +719,11 @@ function createApp(options = {}) {
         pending_communities: one("SELECT COUNT(*) AS n FROM communities WHERE status='pending'").n,
         posts: one('SELECT COUNT(*) AS n FROM posts').n,
         upcoming_events: one("SELECT COUNT(*) AS n FROM events WHERE status='open' AND starts_at > ?", now()).n,
-        open_reports: one("SELECT COUNT(*) AS n FROM reports WHERE status='open'").n
+        open_reports: one("SELECT COUNT(*) AS n FROM reports WHERE status IN ('open','in_review')").n
       };
       const communities = many("SELECT c.*,u.name AS creator_name FROM communities c JOIN users u ON u.id=c.created_by WHERE c.status='pending' ORDER BY c.created_at",);
       const users = many('SELECT id,email,name,hometown,role,disabled,created_at FROM users ORDER BY created_at DESC LIMIT 100');
-      const reports = many("SELECT r.*,u.name AS reporter_name FROM reports r JOIN users u ON u.id=r.reporter_id ORDER BY CASE r.status WHEN 'open' THEN 0 ELSE 1 END,r.created_at DESC LIMIT 100").map(report => ({ ...report, ...reportTargetInfo(report) }));
+      const reports = many("SELECT r.*,u.name AS reporter_name FROM reports r JOIN users u ON u.id=r.reporter_id ORDER BY CASE r.status WHEN 'open' THEN 0 WHEN 'in_review' THEN 1 ELSE 2 END,r.created_at DESC LIMIT 100").map(report => ({ ...report, ...reportTargetInfo(report), messages: reportMessages(report.id), history: reportStatusHistory(report.id) }));
       const moderators = many("SELECT m.community_id,m.user_id,m.created_at,u.name AS user_name,c.name AS community_name FROM memberships m JOIN users u ON u.id=m.user_id JOIN communities c ON c.id=m.community_id WHERE m.role='moderator' AND m.status='active'");
       const memberships = many("SELECT m.community_id,m.user_id,m.role,m.created_at,u.name AS user_name,c.name AS community_name FROM memberships m JOIN users u ON u.id=m.user_id JOIN communities c ON c.id=m.community_id WHERE m.status='active' AND c.status='approved' ORDER BY c.name,u.name");
       send(res, 200, { counts, analytics: analyticsSnapshot(), communities: communities.map(communitySummary), users, reports, categories: many('SELECT name,created_at FROM content_categories ORDER BY name'), tags: many('SELECT name,created_at FROM content_tags ORDER BY name'), moderators, memberships }); return true;
@@ -664,14 +750,26 @@ function createApp(options = {}) {
       if (disabled) for (const [token, session] of sessions) if (session.userId === target.id) sessions.delete(token);
       send(res, 200, { disabled: Boolean(disabled) }); return true;
     }
+    if (method === 'POST' && parts[1] === 'admin' && parts[2] === 'reports' && parts[3] && parts[4] === 'messages') {
+      const admin = requireAdmin(req), report = one('SELECT * FROM reports WHERE id=?', parts[3]);
+      if (!report) fail(404, 'Report not found.');
+      const message = text(body.message, 1500);
+      if (message.length < 2) fail(400, 'Write a response before sending.');
+      run('INSERT INTO report_messages(id,report_id,author_id,body,created_at) VALUES(?,?,?,?,?)', uuid(), report.id, admin.id, message, now());
+      notify(report.reporter_id, 'report_update', 'A platform administrator sent you an update about your report.', '');
+      send(res, 201, { ok: true }); return true;
+    }
     if (method === 'POST' && parts[1] === 'admin' && parts[2] === 'reports' && parts[3] && parts[4] === 'resolve') {
       const admin = requireAdmin(req), report = one('SELECT * FROM reports WHERE id=?', parts[3]); if (!report) fail(404, 'Report not found.');
       const status = body.status;
-      if (!['open', 'resolved', 'dismissed'].includes(status)) fail(400, 'Choose open, resolved, or dismissed.');
+      if (!['open', 'in_review', 'resolved', 'dismissed'].includes(status)) fail(400, 'Choose open, in review, resolved, or dismissed.');
       const resolutionNote = text(body.resolution_note, 1000);
-      const resolvedAt = status === 'open' ? null : now();
-      run('UPDATE reports SET status=?,resolved_by=?,resolved_at=?,resolution_note=? WHERE id=?', status, status === 'open' ? null : admin.id, resolvedAt, status === 'open' ? '' : resolutionNote, report.id);
-      if (status !== 'open' && report.status === 'open') notify(report.reporter_id, 'report_update', 'A platform administrator reviewed your report.', '');
+      const response = text(body.response, 1500), isClosed = status === 'resolved' || status === 'dismissed';
+      const resolvedAt = isClosed ? now() : null;
+      run('UPDATE reports SET status=?,resolved_by=?,resolved_at=?,resolution_note=? WHERE id=?', status, isClosed ? admin.id : null, resolvedAt, status === 'open' ? '' : resolutionNote, report.id);
+      recordReportStatus(report.id, admin.id, report.status, status);
+      if (response) run('INSERT INTO report_messages(id,report_id,author_id,body,created_at) VALUES(?,?,?,?,?)', uuid(), report.id, admin.id, response, now());
+      if (status !== report.status || response) notify(report.reporter_id, 'report_update', response ? 'A platform administrator updated your report.' : status === 'in_review' ? 'A platform administrator is reviewing your report.' : status === 'open' ? 'Your report was reopened for review.' : 'A platform administrator reviewed your report.', '');
       send(res, 200, { status, resolved_at: resolvedAt }); return true;
     }
     if (method === 'POST' && parts[1] === 'admin' && parts[2] === 'categories') {
