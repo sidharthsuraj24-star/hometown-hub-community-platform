@@ -35,11 +35,14 @@ There is **no demo activity or sample user data** in a fresh database. The “Pa
 
 The configured platform administrator is created on first startup when both `PLATFORM_ADMIN_EMAIL` and `PLATFORM_ADMIN_PASSWORD` are present and the email is not already registered. The password is scrypt-hashed; it is not stored in plaintext. Admin credentials are not included in this repository.
 
-To run syntax checks and automated tests:
+To run syntax checks and automated tests, then the optional local performance smoke check:
 
 ```sh
 npm run check
+npm run nfr:smoke
 ```
+
+The smoke check uses 10 concurrent anonymous clients and temporary local data. It measures HTTP app-shell readiness after initial assets and API responses arrive, not browser rendering or production capacity; see [docs/TECHNICAL.md](docs/TECHNICAL.md) for the exact scope and evidence.
 
 Health check: `GET /api/health`.
 
@@ -61,6 +64,8 @@ curl http://localhost:3000/api/health
 By default, SQLite data and uploaded images live under `data/`, which is ignored by Git. Override `DATA_DIR` to use another persistent directory. The app uses SQLite WAL mode, prepared statements, and transaction-safe RSVP capacity checks. Authentication sessions and rate limits are held in memory and are reset when the process restarts. Run one app instance against its local persistent data directory; this release does not support shared multi-instance state.
 
 Analytics are derived from real database records, not sample values. A non-admin member’s authenticated requests record a daily activity row at UTC-day granularity; rows older than 90 days are pruned when the app starts. The dashboard’s event metric is an RSVP-intent rate—not verified attendance—and growth percentages are withheld when the prior period is zero. No third-party analytics service is used.
+
+Profile hometowns and community locations are bounded free-text labels, allowing city, village, or region names without preloaded geography data. Structured geographic hierarchies, geocoding, and distance-based discovery are not included.
 
 ## Scope and deployment limits
 

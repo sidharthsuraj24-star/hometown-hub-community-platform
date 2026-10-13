@@ -9,6 +9,7 @@
   "scripts": {
     "start": "node --env-file-if-exists=.env server.js",
     "test": "node --test",
-    "check": "node --check server.js && node --check public/app.js && node --test"
+    "check": "node --check server.js && node --check public/app.js && node --test",
+    "nfr:smoke": "node scripts/nfr-smoke.js"
   }
 }
