@@ -48,7 +48,7 @@ Health check: `GET /api/health`.
 
 ## Self-host with Docker Compose
 
-The Compose setup stores the SQLite database and uploaded images in the persistent `hometown-hub-data` volume. It starts the app as a non-root user and includes a health check.
+The Compose setup stores the SQLite database and uploaded images in the persistent `hometown-hub-data` volume. It starts the app as a non-root user, binds the published HTTP port to loopback by default, and includes a health check.
 
 ```sh
 cp .env.example .env
@@ -57,7 +57,7 @@ docker compose up --build -d
 curl http://localhost:3000/api/health
 ```
 
-`PORT` in `.env` selects the host-side port. Compose binds the app inside the container on port 3000 and provides `NODE_ENV=production`, which sets secure cookies and production security headers. Put the service behind HTTPS before using it outside a trusted network. Preserve and back up the named data volume, including both SQLite data and uploads; test restore procedures before relying on it.
+`PORT` in `.env` selects the host-side port. Compose binds the app inside the container on port 3000 and publishes it only on `127.0.0.1`; place a TLS-terminating reverse proxy on the same host before allowing external traffic. Do not expose the app's HTTP port directly to the Internet. Compose provides `NODE_ENV=production`, which sets secure cookies and production security headers. Preserve and back up the named data volume, including both SQLite data and uploads; test restore procedures before relying on it.
 
 ## Local data and operation
 
@@ -69,10 +69,10 @@ Profile hometowns and community locations are bounded free-text labels, allowing
 
 ## Scope and deployment limits
 
-- This is a private-project Phase 1 build. No production project or public deployment is configured.
+- This is a private-project Phase 1 build. The live Vercel deployment is protected by Vercel Authentication and is not a public launch.
 - The app includes in-app notifications; external email, SMS, and web-push delivery are not configured. There are no account recovery or email-verification flows.
 - Human moderators/admins handle content reports. No advanced or AI moderation, emergency/government feed, advertising, marketplace, or native mobile client is included.
-- Post images are limited to 1.5 MB and stored locally. Use durable storage and backups for any real deployment.
+- Post images are limited to 1.5 MB; local development stores them under `DATA_DIR`, while production uses the private Supabase Storage bucket through the server only. Back up the database and media for any real deployment.
 - The included Docker path is for a persistent single-instance host; it does not provide a managed database, distributed rate limiting, central session storage, automated backup service, or a formal security audit.
 - **Open product question:** should “Pandit onboarding” and “Sample Pandit Data” mean Hindu-priest service listings, or are those references unrelated template text? No Pandit module or records are included pending product-owner clarification.
 

@@ -35,6 +35,7 @@ async function register(ctx, client, name, email) {
   const result = await call(ctx, client, '/api/auth/register', 'POST', { name, email, password: 'member-password-123' });
   assert.equal(result.response.status, 201, JSON.stringify(result.data));
   client.email = email;
+  client.userId = result.data.user.id;
   return result.data.user;
 }
 async function loginAdmin(ctx, client) {
@@ -56,8 +57,9 @@ async function joinAndApprove(ctx, member, owner, communityId) {
   assert.equal(joined.response.status, 201, JSON.stringify(joined.data));
   const requests = await call(ctx, owner, `/api/communities/${communityId}/requests`);
   assert.equal(requests.response.status, 200, JSON.stringify(requests.data));
-  const request = requests.data.requests.find(item => item.email === member.email);
+  const request = requests.data.requests.find(item => item.id === member.userId);
   assert.ok(request, 'member request is visible to the community moderator');
+  assert.equal(Object.hasOwn(request, 'email'), false, 'moderators should not receive member email addresses');
   const decision = await call(ctx, owner, `/api/communities/${communityId}/requests/${request.id}`, 'POST', { action: 'approve' });
   assert.equal(decision.response.status, 200, JSON.stringify(decision.data));
 }
@@ -103,6 +105,8 @@ test('community requests require platform review and member approval; moderators
   assert.equal(feed.data.posts[0].pinned, 1);
   assert.equal(feed.data.posts[0].kind, 'announcement');
   assert.equal(feed.data.posts[0].can_moderate, false);
+  const privatePostReport = await call(ctx, outsider, '/api/reports', 'POST', { target_type: 'post', target_id: feed.data.posts[0].id, reason: 'This report should not expose private community content.' });
+  assert.equal(privatePostReport.response.status, 404, 'a non-member cannot use reports to access private post details');
   const promoted = await call(ctx, admin, `/api/admin/communities/${communityId}/members/${memberUser.id}/role`, 'POST', { role: 'moderator' });
   assert.equal(promoted.response.status, 200, JSON.stringify(promoted.data));
   const moderatorUnpin = await call(ctx, member, `/api/posts/${post.data.id}/pin`, 'POST', { pinned: false });
@@ -274,9 +278,10 @@ test('community moderators manage guidelines and event hosts can edit or cancel 
 test('reporters can track cases, exchange public updates, and appeal while private admin notes stay private', async t => {
   const ctx = await fixture(t), admin = ctx.admin, reporter = { cookie: '' }, other = { cookie: '' };
   await loginAdmin(ctx, admin);
-  const reporterUser = await register(ctx, reporter, 'Reporting Member', 'reporter-case@example.test');
-  await register(ctx, other, 'Other Member', 'other-case@example.test');
-  const reported = await call(ctx, reporter, '/api/reports', 'POST', { target_type: 'user', target_id: reporterUser.id, reason: 'Please review this account for a possible impersonation concern.' });
+  await register(ctx, reporter, 'Reporting Member', 'reporter-case@example.test');
+  const reportedUser = await register(ctx, other, 'Other Member', 'other-case@example.test');
+  await call(ctx, other, '/api/profile', 'POST', { name: 'Other Member', hometown: 'Secret Village', bio: 'This private hometown should not leak to a reporter.' });
+  const reported = await call(ctx, reporter, '/api/reports', 'POST', { target_type: 'user', target_id: reportedUser.id, reason: 'Please review this account for a possible impersonation concern.' });
   assert.equal(reported.response.status, 201, JSON.stringify(reported.data));
   const reportId = reported.data.id;
   const adminAlerts = await call(ctx, admin, '/api/notifications');
@@ -286,6 +291,8 @@ test('reporters can track cases, exchange public updates, and appeal while priva
   assert.equal(ownCases.response.status, 200);
   assert.equal(ownCases.data.reports.length, 1);
   assert.equal(ownCases.data.reports[0].status, 'open');
+  assert.equal(ownCases.data.reports[0].target_summary, 'Account report');
+  assert.doesNotMatch(ownCases.data.reports[0].target_context, /Secret Village/);
   assert.equal(Object.hasOwn(ownCases.data.reports[0], 'resolution_note'), false);
   assert.equal(ownCases.data.reports[0].history.length, 1);
   assert.equal((await call(ctx, other, '/api/reports')).data.reports.length, 0);
@@ -297,9 +304,15 @@ test('reporters can track cases, exchange public updates, and appeal while priva
   assert.equal(review.response.status, 200, JSON.stringify(review.data));
   const inReview = await call(ctx, reporter, '/api/reports');
   assert.equal(inReview.data.reports[0].status, 'in_review');
-  assert.ok(inReview.data.reports[0].messages.some(message => message.author_role === 'admin' && /started reviewing/.test(message.body)));
+  const reporterAdminMessage = inReview.data.reports[0].messages.find(message => message.author_role === 'admin' && /started reviewing/.test(message.body));
+  assert.ok(reporterAdminMessage);
+  assert.equal(Object.hasOwn(reporterAdminMessage, 'author_id'), false);
+  assert.equal(Object.hasOwn(reporterAdminMessage, 'author_name'), false);
+  assert.equal(Object.hasOwn(inReview.data.reports[0].history[0], 'actor_name'), false);
   const privateAtReview = await call(ctx, admin, '/api/admin/dashboard');
-  assert.equal(privateAtReview.data.reports.find(item => item.id === reportId).resolution_note, 'This note must remain private.');
+  const adminCase = privateAtReview.data.reports.find(item => item.id === reportId);
+  assert.equal(adminCase.resolution_note, 'This note must remain private.');
+  assert.match(adminCase.target_context, /Hometown: Secret Village/, 'only platform administrators receive the reported account hometown');
 
   const followUp = await call(ctx, reporter, `/api/reports/${reportId}/messages`, 'POST', { message: 'I can provide more context about the account and the concern.' });
   assert.equal(followUp.response.status, 201, JSON.stringify(followUp.data));
@@ -319,9 +332,9 @@ test('reporters can track cases, exchange public updates, and appeal while priva
   assert.equal(reopened.status, 'open');
   assert.equal(reopened.resolved_at, null);
   assert.ok(reopened.history.some(item => item.from_status === 'resolved' && item.to_status === 'open'));
-  const adminCase = (await call(ctx, admin, '/api/admin/dashboard')).data.reports.find(item => item.id === reportId);
-  assert.equal(adminCase.resolution_note, '');
-  assert.ok(adminCase.messages.some(message => /requesting another review/.test(message.body)));
+  const currentAdminCase = (await call(ctx, admin, '/api/admin/dashboard')).data.reports.find(item => item.id === reportId);
+  assert.equal(currentAdminCase.resolution_note, '');
+  assert.ok(currentAdminCase.messages.some(message => /requesting another review/.test(message.body)));
 });
 
 test('existing report tables are migrated with the resolution-note field', async t => {
@@ -366,4 +379,27 @@ test('production mode keeps transport-security headers and fails closed without 
   assert.equal(server.database, null, 'production must never fall back to SQLite');
   assert.equal(fs.existsSync(path.join(dataDir, 'hometown-hub.sqlite')), false);
   assert.equal(fs.existsSync(path.join(dataDir, 'uploads')), false);
+});
+
+test('production request errors are redacted from hosted logs and client responses', async t => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hometown-hub-redacted-'));
+  const server = createApp({ dataDir, nodeEnv: 'production', env: {} });
+  await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
+  t.after(async () => {
+    server.closeAllConnections();
+    await new Promise(resolve => server.close(resolve));
+    server.closeDatabase();
+    fs.rmSync(dataDir, { recursive: true, force: true });
+  });
+  const originalError = console.error;
+  const logged = [];
+  console.error = (...args) => logged.push(args.map(String).join(' '));
+  let response;
+  try { response = await fetch(`http://127.0.0.1:${server.address().port}/api/%E0%A4%A`); }
+  finally { console.error = originalError; }
+  assert.equal(response.status, 500);
+  assert.deepEqual(await response.json(), { error: 'Something went wrong. Please try again.' });
+  assert.equal(logged.length, 1);
+  assert.match(logged[0], /^hometown_hub_request_failure /);
+  assert.doesNotMatch(logged[0], /URI malformed|at .*server\.js|%E0%A4%A/);
 });
