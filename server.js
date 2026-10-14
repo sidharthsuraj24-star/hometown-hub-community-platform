@@ -132,13 +132,20 @@ function createApp(options = {}) {
     'X-Content-Type-Options': 'nosniff', 'X-Frame-Options': 'DENY',
     'X-DNS-Prefetch-Control': 'off', 'X-Permitted-Cross-Domain-Policies': 'none',
     'Cross-Origin-Opener-Policy': 'same-origin',
+    'Cross-Origin-Resource-Policy': 'same-origin',
     'Referrer-Policy': 'strict-origin-when-cross-origin', 'Permissions-Policy': 'camera=(), microphone=(), geolocation=()',
-    'Content-Security-Policy': "default-src 'self'; script-src 'self'; style-src 'self'; style-src-attr 'unsafe-inline'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
+    'Content-Security-Policy': "default-src 'self'; script-src 'self'; style-src 'self'; style-src-attr 'none'; img-src 'self' data:; connect-src 'self'; object-src 'none'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'",
     ...(isProduction ? { 'Strict-Transport-Security': 'max-age=63072000; includeSubDomains' } : {})
   };
   function send(res, status, data, extra = {}) {
     res.writeHead(status, { ...headers, 'Content-Type': 'application/json; charset=utf-8', 'Cache-Control': 'no-store', ...extra });
     res.end(JSON.stringify(data));
+  }
+  function logUnexpected(error) {
+    if (!isProduction) { console.error(error); return; }
+    const name = typeof error?.name === 'string' && /^[A-Za-z][A-Za-z0-9_]{0,39}$/.test(error.name) ? error.name : 'Error';
+    const code = typeof error?.code === 'string' && /^[A-Za-z0-9_-]{1,40}$/.test(error.code) ? error.code : 'NO_CODE';
+    console.error('hometown_hub_request_failure', `${name}:${code}`);
   }
   function cookie(token, clear = false) {
     const bits = [`${COOKIE_NAME}=${clear ? '' : encodeURIComponent(token)}`, 'HttpOnly', 'SameSite=Lax', 'Path=/'];
@@ -304,7 +311,7 @@ function createApp(options = {}) {
     };
   }
 
-  async function reportTargetInfo(report) {
+  async function reportTargetInfo(report, { reporterView = false } = {}) {
     let target = null;
     let summary = 'Target is no longer available.';
     let context = '';
@@ -333,17 +340,34 @@ function createApp(options = {}) {
     } else if (report.target_type === 'user') {
       target = await one('SELECT id,name,hometown FROM users WHERE id=?', report.target_id);
       if (target) {
-        summary = target.name;
-        context = target.hometown ? `Reported account · Hometown: ${target.hometown}` : 'Reported account';
+        summary = reporterView ? 'Account report' : target.name;
+        context = reporterView ? 'Reported account details are available only to platform administrators.' : target.hometown ? `Reported account · Hometown: ${target.hometown}` : 'Reported account';
       }
     }
     return { target_summary: text(summary, 1000), target_context: text(context, 1200), target_link: link, target_available: Boolean(target) };
   }
-  async function reportMessages(reportId) {
-    return await many('SELECT m.id,m.body,m.created_at,u.id AS author_id,u.name AS author_name,u.role AS author_role FROM report_messages m JOIN users u ON u.id=m.author_id WHERE m.report_id=? ORDER BY m.created_at ASC', reportId);
+  async function reportTargetIsVisible(targetType, targetId, user) {
+    if (targetType === 'user') return Boolean(await one('SELECT id FROM users WHERE id=?', targetId));
+    if (targetType === 'community') {
+      const community = await one('SELECT status,created_by FROM communities WHERE id=?', targetId);
+      return Boolean(community && (user.role === 'admin' || community.status === 'approved' || community.created_by === user.id));
+    }
+    const post = targetType === 'post'
+      ? await one('SELECT p.community_id,c.status FROM posts p JOIN communities c ON c.id=p.community_id WHERE p.id=?', targetId)
+      : targetType === 'comment'
+        ? await one('SELECT p.community_id,c.status FROM comments cm JOIN posts p ON p.id=cm.post_id JOIN communities c ON c.id=p.community_id WHERE cm.id=?', targetId)
+        : null;
+    if (!post || post.status !== 'approved') return false;
+    if (user.role === 'admin') return true;
+    return Boolean(await one("SELECT 1 FROM memberships WHERE community_id=? AND user_id=? AND status='active'", post.community_id, user.id));
   }
-  async function reportStatusHistory(reportId) {
-    return await many('SELECT h.from_status,h.to_status,h.created_at,u.name AS actor_name,u.role AS actor_role FROM report_status_history h JOIN users u ON u.id=h.actor_id WHERE h.report_id=? ORDER BY h.created_at ASC', reportId);
+  async function reportMessages(reportId, { reporterView = false } = {}) {
+    const columns = reporterView ? 'm.body,m.created_at,u.role AS author_role' : 'm.id,m.body,m.created_at,u.id AS author_id,u.name AS author_name,u.role AS author_role';
+    return await many(`SELECT ${columns} FROM report_messages m JOIN users u ON u.id=m.author_id WHERE m.report_id=? ORDER BY m.created_at ASC`, reportId);
+  }
+  async function reportStatusHistory(reportId, { reporterView = false } = {}) {
+    const columns = reporterView ? 'h.from_status,h.to_status,h.created_at' : 'h.from_status,h.to_status,h.created_at,u.name AS actor_name,u.role AS actor_role';
+    return await many(`SELECT ${columns} FROM report_status_history h JOIN users u ON u.id=h.actor_id WHERE h.report_id=? ORDER BY h.created_at ASC`, reportId);
   }
   async function recordReportStatus(reportId, actorId, fromStatus, toStatus) {
     if (fromStatus === toStatus) return;
@@ -443,7 +467,7 @@ function createApp(options = {}) {
     }
     if (method === 'GET' && parts[1] === 'communities' && parts[2] && parts[3] === 'requests') {
       const user = await requireUser(req), id = parts[2]; await requireModerator(id, user);
-      send(res, 200, { requests: await many("SELECT u.id,u.name,u.email,u.hometown,m.created_at AS requested_at FROM memberships m JOIN users u ON u.id=m.user_id WHERE m.community_id=? AND m.status='pending' ORDER BY m.created_at", id) }); return true;
+      send(res, 200, { requests: await many("SELECT u.id,u.name,u.hometown,m.created_at AS requested_at FROM memberships m JOIN users u ON u.id=m.user_id WHERE m.community_id=? AND m.status='pending' ORDER BY m.created_at", id) }); return true;
     }
     if (method === 'POST' && parts[1] === 'communities' && parts[2] && parts[3] === 'requests' && parts[4]) {
       const user = await requireUser(req), communityId = parts[2], targetUser = parts[4]; await requireModerator(communityId, user);
@@ -640,7 +664,7 @@ function createApp(options = {}) {
       const user = await requireUser(req);
       const reports = await Promise.all((await many('SELECT * FROM reports WHERE reporter_id=? ORDER BY created_at DESC LIMIT 100', user.id)).map(async report => {
         const { resolution_note, resolved_by, ...reporterReport } = report;
-        return { ...reporterReport, ...(await reportTargetInfo(report)), messages: await reportMessages(report.id), history: await reportStatusHistory(report.id) };
+        return { ...reporterReport, ...(await reportTargetInfo(report, { reporterView: true })), messages: await reportMessages(report.id, { reporterView: true }), history: await reportStatusHistory(report.id, { reporterView: true }) };
       }));
       send(res, 200, { reports }); return true;
     }
@@ -648,8 +672,7 @@ function createApp(options = {}) {
       await rateLimit(req, 'report');
       const user = await requireUser(req), targetType = text(body.target_type, 20), targetId = text(body.target_id, 64), reason = text(body.reason, 1000);
       if (!['user', 'post', 'comment', 'community'].includes(targetType) || !targetId || reason.length < 10) fail(400, 'Choose content to report and describe the issue in at least 10 characters.');
-      const exists = targetType === 'user' ? await one('SELECT id FROM users WHERE id=?', targetId) : targetType === 'post' ? await one('SELECT id FROM posts WHERE id=?', targetId) : targetType === 'comment' ? await one('SELECT id FROM comments WHERE id=?', targetId) : await one('SELECT id FROM communities WHERE id=?', targetId);
-      if (!exists) fail(404, 'The reported item was not found.');
+      if (!await reportTargetIsVisible(targetType, targetId, user)) fail(404, 'The reported item was not found.');
       const id = uuid(); await run('INSERT INTO reports(id,reporter_id,target_type,target_id,reason,created_at) VALUES(?,?,?,?,?,?)', id, user.id, targetType, targetId, reason, now());
       await recordReportStatus(id, user.id, '', 'open');
       await notifyAdmins('report_case', 'A member submitted a report that is ready for review.');
@@ -792,7 +815,7 @@ function createApp(options = {}) {
     } catch (error) {
       if (res.headersSent) { res.destroy(); return; }
       const status = error instanceof HttpError ? error.status : 500;
-      if (!(error instanceof HttpError)) console.error(error);
+      if (!(error instanceof HttpError)) logUnexpected(error);
       send(res, status, { error: error instanceof HttpError ? error.message : 'Something went wrong. Please try again.' });
     }
   };

@@ -26,6 +26,10 @@ test('Vercel entrypoint exports a lazy Fetch function and does not listen on imp
     assert.equal(health.status, 200);
     assert.match(health.headers.get('content-type'), /application\/json/);
     assert.equal(health.headers.get('strict-transport-security'), 'max-age=63072000; includeSubDomains');
+    assert.equal(health.headers.get('cross-origin-opener-policy'), 'same-origin');
+    assert.equal(health.headers.get('cross-origin-resource-policy'), 'same-origin');
+    assert.match(health.headers.get('content-security-policy'), /style-src-attr 'none'/);
+    assert.doesNotMatch(health.headers.get('content-security-policy'), /unsafe-inline/);
     const login = await handler.fetch(new Request('http://localhost/api/auth/login', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json', Origin: 'http://localhost' },
@@ -54,8 +58,15 @@ test('Vercel routes API and private uploads to the function and secures static r
   const headers = new Map(config.headers[0].headers.map(header => [header.key.toLowerCase(), header.value]));
   assert.equal(headers.get('strict-transport-security'), 'max-age=63072000; includeSubDomains');
   assert.equal(headers.get('x-frame-options'), 'DENY');
+  assert.equal(headers.get('x-dns-prefetch-control'), 'off');
+  assert.equal(headers.get('x-permitted-cross-domain-policies'), 'none');
+  assert.equal(headers.get('cross-origin-opener-policy'), 'same-origin');
+  assert.equal(headers.get('cross-origin-resource-policy'), 'same-origin');
   assert.match(headers.get('content-security-policy'), /script-src 'self'/);
-  assert.match(headers.get('content-security-policy'), /style-src-attr 'unsafe-inline'/);
+  assert.match(headers.get('content-security-policy'), /style-src-attr 'none'/);
+  assert.doesNotMatch(headers.get('content-security-policy'), /unsafe-inline/);
+  const appJs = fs.readFileSync(path.join(__dirname, '..', 'public/app.js'), 'utf8');
+  assert.doesNotMatch(appJs, /\sstyle=/i, 'the app must not depend on inline styles');
 });
 
 test('Supabase setup remains private and contains no bootstrap records or public bucket', () => {
@@ -64,4 +75,32 @@ test('Supabase setup remains private and contains no bootstrap records or public
   assert.match(storage, /public\s*=\s*false/i);
   assert.doesNotMatch(storage, /create\s+policy/i);
   assert.doesNotMatch(schema, /insert\s+into\s+(users|communities|events|posts)\b/i);
+});
+
+test('Fetch adapter ignores client-controlled forwarding headers for rate limits', async t => {
+  const { createApp } = require('../server');
+  const { createFetchHandler } = require('../lib/fetch-handler');
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hometown-hub-client-ip-'));
+  const app = createApp({ dataDir, adminEmail: 'admin@example.test', adminPassword: 'test-admin-password-123' });
+  const handler = createFetchHandler(() => app);
+  t.after(() => { app.closeDatabase(); fs.rmSync(dataDir, { recursive: true, force: true }); });
+  const attempt = headers => handler(new Request('http://localhost/api/auth/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', Origin: 'http://localhost', ...headers },
+    body: JSON.stringify({ email: 'unknown@example.test', password: 'incorrect-password' })
+  }));
+
+  for (let index = 0; index < 12; index += 1) {
+    const response = await attempt({ 'X-Forwarded-For': `198.51.100.${index + 1}`, 'X-Real-IP': `203.0.113.${index + 1}` });
+    assert.equal(response.status, 401);
+  }
+  assert.equal((await attempt({ 'X-Forwarded-For': '192.0.2.201', 'X-Real-IP': '192.0.2.202' })).status, 429,
+    'changing generic forwarding headers must not bypass the shared unknown-IP bucket');
+
+  for (let index = 0; index < 12; index += 1) {
+    const response = await attempt({ 'X-Vercel-Forwarded-For': '198.51.100.44', 'X-Forwarded-For': `192.0.2.${index + 1}`, 'X-Real-IP': `203.0.113.${index + 1}` });
+    assert.equal(response.status, 401);
+  }
+  assert.equal((await attempt({ 'X-Vercel-Forwarded-For': '198.51.100.44', 'X-Forwarded-For': '192.0.2.250', 'X-Real-IP': '203.0.113.250' })).status, 429,
+    'only the Vercel-provided IP header should determine the bucket');
 });
