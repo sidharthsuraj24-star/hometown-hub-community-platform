@@ -340,9 +340,9 @@ test('existing report tables are migrated with the resolution-note field', async
   assert.ok(tables.includes('report_status_history'));
 });
 
-test('production mode enables transport-security headers and Secure session cookies', async t => {
+test('production mode keeps transport-security headers and fails closed without Supabase', async t => {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hometown-hub-production-'));
-  const server = createApp({ dataDir, nodeEnv: 'production', adminEmail: 'prod-admin@example.test', adminPassword: 'production-admin-password-123' });
+  const server = createApp({ dataDir, nodeEnv: 'production', env: {}, adminEmail: 'prod-admin@example.test', adminPassword: 'production-admin-password-123' });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   const base = `http://127.0.0.1:${server.address().port}`;
   t.after(async () => {
@@ -361,9 +361,9 @@ test('production mode enables transport-security headers and Secure session cook
     headers: { 'Content-Type': 'application/json', Origin: base },
     body: JSON.stringify({ email: 'prod-admin@example.test', password: 'production-admin-password-123' })
   });
-  assert.equal(login.status, 200);
-  const cookie = login.headers.get('set-cookie');
-  assert.match(cookie, /HttpOnly/);
-  assert.match(cookie, /SameSite=Lax/);
-  assert.match(cookie, /Secure/);
+  assert.equal(login.status, 503);
+  assert.equal(login.headers.get('set-cookie'), null);
+  assert.equal(server.database, null, 'production must never fall back to SQLite');
+  assert.equal(fs.existsSync(path.join(dataDir, 'hometown-hub.sqlite')), false);
+  assert.equal(fs.existsSync(path.join(dataDir, 'uploads')), false);
 });

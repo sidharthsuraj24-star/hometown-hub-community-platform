@@ -4,12 +4,12 @@
 
 - **Runtime:** Node.js 22.13+; tested with Node 24.19.
 - **HTTP/API:** Node built-in `http` server and JSON REST-style endpoints; no third-party runtime package is required.
-- **Database:** built-in `node:sqlite`/SQLite with prepared statements, foreign keys, indexes, WAL mode, a busy timeout, and immediate transactions for capacity-limited RSVPs.
+- **Database:** local development/tests use built-in `node:sqlite`; the production adapter uses a server-only `pg` pool (Supabase transaction pooler, SSL, max one connection), parameter mapping, bounded timeouts, and connection-bound transactions for community/RSVP critical sections.
 - **Frontend:** vanilla JavaScript, semantic HTML, and responsive CSS served from `public/`.
-- **Uploads:** locally stored verified PNG/JPEG/WebP files under `DATA_DIR/uploads/`, randomized filenames, 1.5 MB limit.
+- **Uploads:** local development/tests use verified PNG/JPEG/WebP files under `DATA_DIR/uploads/`; production uses the private `hometown-post-images` Supabase Storage bucket through the server-only service role, with no public URLs or browser credentials.
 - **Local persistence:** `DATA_DIR/hometown-hub.sqlite` (default `data/hometown-hub.sqlite`).
 
-The app is a single-process private-project build. The included Docker/Compose configuration is intended for a persistent single-instance host; the app is not configured for Vercel/serverless or horizontal scaling.
+The app keeps a local SQLite mode for development and tests. Vercel uses an awaitable Node handler and Mumbai (`bom1`) routing; public files remain static while `/api/*` and `/uploads/*` reach the function. Production persistence is designed for Supabase, with server-only credentials.
 
 ## Run and configure
 
@@ -110,3 +110,13 @@ The RSVP handler runs `BEGIN IMMEDIATE`, checks an existing RSVP and counts acti
 ## Verification
 
 Run `npm run check` for JavaScript syntax checks and API integration tests, including registration, community approval/member roles, image access controls, guideline authorization and notifications, event edit/cancel permissions, 8-way RSVP capacity enforcement and attendee notifications, data-derived KPI calculations, reporter case tracking/appeals, public case messages versus private admin notes, report status history, report-schema migration, multi-locality values, and security safeguards. Tests use temporary SQLite databases and do not create repository seed data. Run `npm run nfr:smoke` separately for the app-shell HTTP timing check described above.
+
+## Vercel/Supabase migration status
+
+- `server.js` and `api/index.mjs` expose the same Fetch-standard adapter from `lib/fetch-handler.js`, bridging Web requests/responses to the existing Node HTTP handler without calling `listen()` on import. Vercel local dev and a local production build both recognized the handler; the build packaged `api/index.mjs` for Node 24 in Mumbai (`bom1`, 10-second maximum) and configured static-response security headers.
+- `supabase/migrations/001_initial_schema.sql` creates the durable PostgreSQL schema and only the existing non-personal taxonomy vocabulary. `002_private_storage.sql` creates the **private** `hometown-post-images` bucket and deliberately creates no public or client storage policies.
+- `scripts/apply-supabase-migrations.sh` remains the reproducible operator-run setup path and requires an explicitly supplied `SUPABASE_DB_URL`. The new Hometown Hub Supabase project was created on Free in Mumbai at verified `$0/month`; migrations `001`–`003` were applied to that project, enabling default-deny RLS on every public app table. Only the existing non-personal taxonomy vocabulary is present; user, community, post, event, report, session, and activity data remain empty. No preview records were copied.
+- Production routes now use `lib/production-adapter.js` and do not create or fall back to SQLite or local uploads. The adapter uses verified TLS, server-only PostgreSQL and Supabase Storage credentials, hashed persistent sessions, serialized shared rate limits, and the private photo bucket. Image downloads are still authorized against community membership before bytes are returned. The service-role key is never sent to browser code.
+- A supplied administrator email/password will be bootstrapped once on the first non-health API request; an existing non-admin/disabled account will not be promoted, and an existing administrator password will not be overwritten. All non-health API routes fail closed without the production database and administrator configuration. No Hometown Hub administrator details have been submitted, so no admin account or public deployment exists.
+- Vercel has only an empty project shell under the existing Hobby account: no Git source, production environment variables, or hosted deployment exists. The local CLI build created only ignored `.vercel/` settings/build artifacts; it did not deploy. Keep the GitHub repository private and its default branch unchanged. Vercel Hobby requires personal, non-commercial use; owner eligibility confirmation is still required. Supabase Free quotas/pausing apply; neither service should be upgraded or attached to billing for this setup.
+- Local verification: `npm run check` passes all 22 tests; `npm run nfr:smoke` passed at p50 111.4 ms / p95 159.7 ms for 10 concurrent sessions × 6 requests. Vercel's local production build succeeded and packaged the Mumbai Node 24 function; loopback checks returned HTTP 200 for health, 503 for login with backend configuration absent, and the expected security headers. Production adapter tests use mocks only; a live connection and stable URL remain unverified and are blocked pending real admin details, Vercel Hobby eligibility confirmation, and secure production environment setup. Do not interpret these local results as live-service verification.
