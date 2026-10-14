@@ -9,7 +9,11 @@
   "scripts": {
     "start": "node --env-file-if-exists=.env server.js",
     "test": "node --test",
-    "check": "node --check server.js && node --check public/app.js && node --test",
+    "check": "node --check server.js && node --check public/app.js && node --check api/index.mjs && node --test",
     "nfr:smoke": "node scripts/nfr-smoke.js"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.117.3",
+    "pg": "^8.23.1"
   }
 }
