@@ -395,11 +395,19 @@ test('production request errors are redacted from hosted logs and client respons
   const logged = [];
   console.error = (...args) => logged.push(args.map(String).join(' '));
   let response;
-  try { response = await fetch(`http://127.0.0.1:${server.address().port}/api/%E0%A4%A`); }
+  try {
+    let status, headers, body;
+    await server.handle({ get url() { throw new Error('SYNTHETIC_PRIVATE_REQUEST_DETAIL'); } }, {
+      headersSent: false,
+      writeHead(value, values) { status = value; headers = values; },
+      end(value) { body = value; }
+    });
+    response = new Response(body, { status, headers });
+  }
   finally { console.error = originalError; }
   assert.equal(response.status, 500);
   assert.deepEqual(await response.json(), { error: 'Something went wrong. Please try again.' });
   assert.equal(logged.length, 1);
   assert.match(logged[0], /^hometown_hub_request_failure /);
-  assert.doesNotMatch(logged[0], /URI malformed|at .*server\.js|%E0%A4%A/);
+  assert.doesNotMatch(logged[0], /SYNTHETIC_PRIVATE_REQUEST_DETAIL|at .*server\.js/);
 });
