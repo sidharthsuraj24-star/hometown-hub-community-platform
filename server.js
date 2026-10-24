@@ -6,6 +6,7 @@ const path = require('node:path');
 const crypto = require('node:crypto');
 const { DatabaseSync } = require('node:sqlite');
 const { createFetchHandler } = require('./lib/fetch-handler');
+const { initializePanditSchema, createPanditRoutes } = require('./lib/pandit-onboarding');
 
 const ROOT = __dirname;
 const PUBLIC_DIR = path.join(ROOT, 'public');
@@ -77,7 +78,7 @@ function createApp(options = {}) {
     fs.mkdirSync(uploadDir, { recursive: true });
     dbPath = options.dbPath || path.join(dataDir, 'hometown-hub.sqlite');
     db = new DatabaseSync(dbPath);
-    db.exec('PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000;');
+    db.exec('PRAGMA foreign_keys = ON; PRAGMA journal_mode = WAL; PRAGMA busy_timeout = 5000; PRAGMA secure_delete = ON;');
     db.exec(`
       CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, email TEXT NOT NULL UNIQUE COLLATE NOCASE, name TEXT NOT NULL, password_salt TEXT NOT NULL, password_hash TEXT NOT NULL, hometown TEXT NOT NULL DEFAULT '', bio TEXT NOT NULL DEFAULT '', role TEXT NOT NULL DEFAULT 'user', disabled INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL);
       CREATE TABLE IF NOT EXISTS communities (id TEXT PRIMARY KEY, name TEXT NOT NULL, location TEXT NOT NULL, description TEXT NOT NULL, category TEXT NOT NULL, tags TEXT NOT NULL DEFAULT '[]', rules TEXT NOT NULL DEFAULT '', status TEXT NOT NULL DEFAULT 'pending', created_by TEXT NOT NULL REFERENCES users(id), created_at TEXT NOT NULL);
@@ -96,6 +97,10 @@ function createApp(options = {}) {
       CREATE TABLE IF NOT EXISTS content_categories(name TEXT PRIMARY KEY, created_at TEXT NOT NULL); CREATE TABLE IF NOT EXISTS content_tags(name TEXT PRIMARY KEY, created_at TEXT NOT NULL);
       CREATE INDEX IF NOT EXISTS idx_communities_status ON communities(status); CREATE INDEX IF NOT EXISTS idx_memberships_user ON memberships(user_id,status); CREATE INDEX IF NOT EXISTS idx_posts_community_created ON posts(community_id,created_at DESC); CREATE INDEX IF NOT EXISTS idx_events_community_start ON events(community_id,starts_at); CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications(user_id,created_at DESC); CREATE INDEX IF NOT EXISTS idx_reports_status ON reports(status,created_at DESC); CREATE INDEX IF NOT EXISTS idx_comments_post_created ON comments(post_id,created_at); CREATE INDEX IF NOT EXISTS idx_rsvps_event_status ON rsvps(event_id,status); CREATE INDEX IF NOT EXISTS idx_activity_day ON user_activity(activity_day,user_id);
     `);
+    initializePanditSchema(db);
+    // Evidence is kept inside this non-public local database, never public uploads.
+    fs.chmodSync(dbPath, 0o600);
+    for (const suffix of ['-wal', '-shm']) if (fs.existsSync(dbPath + suffix)) fs.chmodSync(dbPath + suffix, 0o600);
     const reportColumns = db.prepare('PRAGMA table_info(reports)').all(); if (!reportColumns.some(column => column.name === 'resolution_note')) db.exec("ALTER TABLE reports ADD COLUMN resolution_note TEXT NOT NULL DEFAULT ''");
     db.prepare('DELETE FROM user_activity WHERE activity_day < ?').run(new Date(Date.now()-89*24*60*60*1000).toISOString().slice(0,10));
   }
@@ -104,6 +109,7 @@ function createApp(options = {}) {
   const many = async (sql, ...args) => adapter ? adapter.many(sql, ...args) : db.prepare(sql).all(...args);
   const transaction = async fn => { if (adapter) return adapter.transaction(fn); db.exec('BEGIN IMMEDIATE'); try { const result = await fn({run,one,many}); db.exec('COMMIT'); return result; } catch (error) { try { db.exec('ROLLBACK'); } catch {} throw error; } };
   if (db) { if (!db.prepare('SELECT name FROM content_categories LIMIT 1').get()) for (const category of DEFAULT_CATEGORIES) db.prepare('INSERT OR IGNORE INTO content_categories(name,created_at) VALUES(?,?)').run(category, now()); if (!db.prepare('SELECT name FROM content_tags LIMIT 1').get()) for (const tag of DEFAULT_TAGS) db.prepare('INSERT OR IGNORE INTO content_tags(name,created_at) VALUES(?,?)').run(tag, now()); if (adminConfigValid && !db.prepare('SELECT id FROM users WHERE email=?').get(adminEmail)) { const hash=passwordHash(adminPassword); db.prepare('INSERT INTO users(id,email,name,password_salt,password_hash,role,created_at) VALUES(?,?,?,?,?,?,?)').run(uuid(),adminEmail,'Platform administrator',hash.salt,hash.hash,'admin',now()); } }
+  if (db && adminConfigValid) initializePanditSchema(db, adminEmail);
   let adminBootstrapPromise = null;
   const backendReady = async () => {
     if (backendError) fail(503, 'The production backend is not configured.');
@@ -142,7 +148,7 @@ function createApp(options = {}) {
     res.end(JSON.stringify(data));
   }
   function logUnexpected(error) {
-    if (!isProduction) { console.error(error); return; }
+    // Never log exception messages/SQL: they can contain private evidence or applicant text.
     const name = typeof error?.name === 'string' && /^[A-Za-z][A-Za-z0-9_]{0,39}$/.test(error.name) ? error.name : 'Error';
     const code = typeof error?.code === 'string' && /^[A-Za-z0-9_-]{1,40}$/.test(error.code) ? error.code : 'NO_CODE';
     console.error('hometown_hub_request_failure', `${name}:${code}`);
@@ -374,13 +380,27 @@ function createApp(options = {}) {
     await run('INSERT INTO report_status_history(id,report_id,actor_id,from_status,to_status,created_at) VALUES(?,?,?,?,?,?)', uuid(), reportId, actorId, fromStatus, toStatus, now());
   }
 
+  const panditTestMode = !isProduction && (options.nodeEnv || env.NODE_ENV) === 'test';
+  const allowPanditSimulations = panditTestMode && options.allowPanditSimulations === true;
+  const panditStorage = panditTestMode && Object.hasOwn(options, 'panditStorageApi') ?
+    require('./lib/pandit-storage-api').createPanditStorageApi({ config: options.panditStorageApi, isProduction, allowSimulations: allowPanditSimulations, nodeEnv: 'test', now: options.panditNow || now, errorFactory: message => new HttpError(503, message) }) :
+    panditTestMode ? options.panditPrivateStorage : null;
+  const panditRoutes = createPanditRoutes({ one, many, transaction, requireUser, send, fail, uuid, now: options.panditNow || now, isProduction, afterPurge: () => { if (db) db.exec('PRAGMA wal_checkpoint(TRUNCATE)'); }, allowSimulations: allowPanditSimulations, privateEvidenceStorage: panditStorage,
+    // Inline fixtures are explicit/test-only, never a fallback for an unavailable API.
+    allowInlineSimulationEvidence: panditTestMode && options.panditInlineSimulationEvidence === true && !Object.hasOwn(options, 'panditStorageApi') });
+
   async function api(req, res, url) {
     const method = req.method;
-    const parts = url.pathname.split('/').filter(Boolean).map(part => decodeURIComponent(part));
+    let parts;
+    try { parts = url.pathname.split('/').filter(Boolean).map(part => decodeURIComponent(part)); }
+    catch { fail(400, 'The request path is malformed.'); }
+    if (isProduction && (['pandits','pandit-application'].includes(parts[1]) || parts[1] === 'admin' && parts[2] === 'pandits')) fail(503, 'Pandit onboarding is local-only and requires a separately authorized production release.');
     if (!(method === 'GET' && parts[1] === 'health')) await backendReady();
     if (!parts.length || parts[0] !== 'api') return false;
     if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(method)) checkOrigin(req);
     const body = ['POST', 'PUT', 'PATCH', 'DELETE'].includes(method) ? await readBody(req) : {};
+
+    if (await panditRoutes(req, res, parts, body)) return true;
 
     if (method === 'GET' && parts[1] === 'health') { send(res, 200, { ok: true, service: 'hometown-hub' }); return true; }
     if (method === 'GET' && parts[1] === 'me') { send(res, 200, { user: await sessionUser(req) || null }); return true; }
@@ -821,6 +841,7 @@ function createApp(options = {}) {
   };
   const server = http.createServer((req, res) => {
     handle(req, res).catch(error => {
+      if (!(error instanceof HttpError)) logUnexpected(error);
       if (res.headersSent) { res.destroy(); return; }
       const status = error instanceof HttpError ? error.status : 500;
       send(res, status, { error: error instanceof HttpError ? error.message : 'Something went wrong. Please try again.' });

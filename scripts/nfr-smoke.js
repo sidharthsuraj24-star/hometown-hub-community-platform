@@ -37,7 +37,7 @@ async function anonymousShellReady(base) {
 
 async function main() {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hometown-hub-perf-'));
-  const server = createApp({ dataDir });
+  const server = createApp({ dataDir, env: {}, nodeEnv: 'test' });
   try {
     await new Promise((resolve, reject) => {
       server.once('error', reject);

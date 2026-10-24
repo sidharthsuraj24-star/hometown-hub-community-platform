@@ -13,6 +13,7 @@
     "nfr:smoke": "node scripts/nfr-smoke.js"
   },
   "dependencies": {
+    "@supabase/storage-js": "^2.117.3",
     "@supabase/supabase-js": "^2.117.3",
     "pg": "^8.23.1"
   }

@@ -3,7 +3,7 @@
 const test = require('node:test');
 const assert = require('node:assert/strict');
 const { X509Certificate } = require('node:crypto');
-const { toPg, hashSessionToken, requiredProductionEnv, databaseSslOptions, createProductionAdapter } = require('../lib/production-adapter');
+const { BUCKET, toPg, hashSessionToken, requiredProductionEnv, databaseSslOptions, createProductionAdapter } = require('../lib/production-adapter');
 
 function mockPool() {
   const calls = [];
@@ -55,6 +55,56 @@ test('production adapter hashes session tokens and uses injected pool/storage', 
   assert.deepEqual(await adapter.download('uuid.png'), Buffer.from('image'));
   await adapter.remove('uuid.png');
   assert.deepEqual(storageCalls.map(call => call[0]), ['upload', 'download', 'remove']);
+  await adapter.close();
+});
+
+test('production Storage adapter sends an sb_secret key in apikey only', async () => {
+  const pool = mockPool();
+  const key = 'sb_secret_synthetic_test_value';
+  const requests = [];
+  const storageFetch = async (input, init = {}) => {
+    const headers = new Headers(init.headers);
+    requests.push({ url: String(input), method: init.method || 'GET', apikey: headers.get('apikey'), authorization: headers.get('authorization') });
+    return new Response(JSON.stringify({ Key: `${BUCKET}/synthetic-file.pdf`, id: 'synthetic-file.pdf' }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' }
+    });
+  };
+  const adapter = createProductionAdapter({
+    env: { SUPABASE_DB_URL: 'postgres://server-only', SUPABASE_URL: 'https://private.example/', SUPABASE_SERVICE_ROLE_KEY: key },
+    pool,
+    storageFetch
+  });
+  assert.equal(await adapter.upload('synthetic-file.pdf', Buffer.from('%PDF-1.4\n'), 'application/pdf'), 'synthetic-file.pdf');
+  assert.equal(requests.length, 1);
+  assert.equal(new URL(requests[0].url).pathname, `/storage/v1/object/${BUCKET}/synthetic-file.pdf`);
+  assert.equal(requests[0].method, 'POST');
+  assert.equal(requests[0].apikey, key);
+  assert.equal(requests[0].authorization, null);
+  await adapter.close();
+});
+
+test('production Storage adapter preserves bearer auth for legacy service_role JWT keys', async () => {
+  const pool = mockPool();
+  const key = 'eyJhbGciOiJIUzI1NiJ9.eyJyb2xlIjoic2VydmljZV9yb2xlIn0.synthetic-signature';
+  const requests = [];
+  const storageFetch = async (input, init = {}) => {
+    const headers = new Headers(init.headers);
+    requests.push({ apikey: headers.get('apikey'), authorization: headers.get('authorization') });
+    return new Response(JSON.stringify({ Key: `${BUCKET}/synthetic-file.pdf`, id: 'synthetic-file.pdf' }), {
+      status: 200,
+      headers: { 'content-type': 'application/json' }
+    });
+  };
+  const adapter = createProductionAdapter({
+    env: { SUPABASE_DB_URL: 'postgres://server-only', SUPABASE_URL: 'https://private.example', SUPABASE_SERVICE_ROLE_KEY: key },
+    pool,
+    storageFetch
+  });
+  assert.equal(await adapter.upload('synthetic-file.pdf', Buffer.from('%PDF-1.4\n'), 'application/pdf'), 'synthetic-file.pdf');
+  assert.equal(requests.length, 1);
+  assert.equal(requests[0].apikey, key);
+  assert.equal(requests[0].authorization, `Bearer ${key}`);
   await adapter.close();
 });
 
