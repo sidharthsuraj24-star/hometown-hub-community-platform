@@ -94,14 +94,14 @@ test('CSS provides visible keyboard focus and a 44px dialog close target', () =>
   const css = fs.readFileSync(path.join(__dirname, '../public/styles.css'), 'utf8');
   assert.match(css, /:focus-visible/);
   assert.match(css, /\.close-button[^}]*width:44px[^}]*height:44px/);
-  assert.match(css.trim(), /:focus-visible\{outline:3px solid #17665a;outline-offset:2px\}$/);
+  assert.match(css.trim(), /:focus-visible\{outline:3px solid #245b86;outline-offset:2px\}$/);
   const luminance = hex => {
     const rgb = hex.match(/../g).map(component => parseInt(component, 16) / 255)
       .map(value => value <= 0.04045 ? value / 12.92 : ((value + 0.055) / 1.055) ** 2.4);
     return rgb[0] * 0.2126 + rgb[1] * 0.7152 + rgb[2] * 0.0722;
   };
-  const ring = luminance('17665a');
-  for (const background of ['ffffff', 'fffefa', 'f7f6f1', 'e6f2ed']) {
+  const ring = luminance('245b86');
+  for (const background of ['ffffff', 'fffefa', 'f7f6f1', 'e8f0f8']) {
     assert.ok((luminance(background) + 0.05) / (ring + 0.05) >= 3, background);
   }
 });
