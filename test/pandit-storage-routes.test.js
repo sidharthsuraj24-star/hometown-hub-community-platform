@@ -39,7 +39,7 @@ async function setup(t, options = {}) {
     return { response, status: response.status, data };
   };
   const login = async (client, email, password = PASSWORD) => { const r = await call(client, '/api/auth/login', 'POST', { email, password }); assert.equal(r.status, 200); return r; };
-  const register = async (email, name) => { const client = {}; const r = await call(client, '/api/auth/register', 'POST', { email, name, password: PASSWORD }); assert.equal(r.status, 201); client.id = r.data.user.id; return client; };
+  const register = async (email, name) => { const client = {}; const r = await call(client, '/api/auth/register', 'POST', { email, name, password: PASSWORD }); assert.equal(r.status, 202); assert.equal(r.response.headers.get('set-cookie'), null); const signedIn = await login(client, email); client.id = signedIn.data.user.id; return client; };
   const admin = {}; await login(admin, 'admin@example.test');
   const owner = await register('synthetic-route-owner@example.test', 'Synthetic route owner');
   const checker = await register('synthetic-route-checker@example.test', 'Synthetic route checker');

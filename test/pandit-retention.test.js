@@ -23,7 +23,7 @@ async function fixture(t, allowPanditSimulations = true) {
     return { status: response.status, data: await response.json().catch(() => ({})) };
   };
   const owner = {}; assert.equal((await request(owner, '/api/auth/login', 'POST', { email: 'admin@example.test', password: 'synthetic-admin-password-123' })).status, 200);
-  const member = {}; const r = await request(member, '/api/auth/register', 'POST', { name: SYNTHETIC, email: 'synthetic-retention@example.test', password: 'synthetic-member-password-123' }); assert.equal(r.status, 201); member.id = r.data.user.id;
+  const member = {}; const email = 'synthetic-retention@example.test', password = 'synthetic-member-password-123'; const r = await request(member, '/api/auth/register', 'POST', { name: SYNTHETIC, email, password }); assert.equal(r.status, 202); const signedIn = await request(member, '/api/auth/login', 'POST', { email, password }); assert.equal(signedIn.status, 200); member.id = signedIn.data.user.id;
   return { server, request, owner, member };
 }
 

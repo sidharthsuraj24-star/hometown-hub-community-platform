@@ -40,8 +40,11 @@ async function call(ctx, client, url, method = 'GET', body) {
 }
 
 async function register(ctx, client, name, email, password = 'member-password-123') {
-  const result = await call(ctx, client, '/api/auth/register', 'POST', { name, email, password });
-  assert.equal(result.response.status, 201, JSON.stringify(result.data));
+  const signup = await call(ctx, client, '/api/auth/register', 'POST', { name, email, password });
+  assert.equal(signup.response.status, 202, JSON.stringify(signup.data));
+  assert.equal(signup.response.headers.get('set-cookie'), null);
+  const result = await call(ctx, client, '/api/auth/login', 'POST', { email, password });
+  assert.equal(result.response.status, 200, JSON.stringify(result.data));
   return result.data.user;
 }
 

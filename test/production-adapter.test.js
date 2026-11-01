@@ -4,6 +4,8 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const { X509Certificate } = require('node:crypto');
 const { BUCKET, toPg, hashSessionToken, requiredProductionEnv, databaseSslOptions, createProductionAdapter } = require('../lib/production-adapter');
+const { createPanditStorageHarness } = require('./helpers/pandit-storage-harness');
+const { LOCK_KEY } = require('../lib/pandit-retention-worker');
 
 function mockPool() {
   const calls = [];
@@ -105,6 +107,34 @@ test('production Storage adapter preserves bearer auth for legacy service_role J
   assert.equal(requests.length, 1);
   assert.equal(requests[0].apikey, key);
   assert.equal(requests[0].authorization, `Bearer ${key}`);
+  await adapter.close();
+});
+
+test('Pandit Storage adapter requires its own explicit flag and dedicated server key, and exposes a transaction lock', async () => {
+  const pool = mockPool(), harness = createPanditStorageHarness();
+  const baseEnv = { SUPABASE_DB_URL: 'postgres://server-only', SUPABASE_URL: 'https://synthetic-project.supabase.co', SUPABASE_SERVICE_ROLE_KEY: 'general-key' };
+  const disabled = createProductionAdapter({ env: baseEnv, pool, storage: {} });
+  assert.equal(disabled.panditEvidenceStorage, null);
+  await disabled.close();
+
+  let clientArgs;
+  const adapter = createProductionAdapter({
+    env: { ...baseEnv, PANDIT_EVIDENCE_STORAGE_ENABLED: 'true', PANDIT_EVIDENCE_STORAGE_KEY: 'mock-service-key' },
+    pool,
+    storage: {},
+    panditCreateSupabaseClient: (...args) => { clientArgs = args; return { storage: harness.storage('service').storage }; },
+  });
+  assert.ok(adapter.panditEvidenceStorage);
+  assert.equal(clientArgs[0], baseEnv.SUPABASE_URL);
+  assert.equal(clientArgs[1], 'mock-service-key');
+  await adapter.panditEvidenceStorage.preflight();
+  assert.equal(harness.calls.filter(call => call.url.includes('/storage/v1/bucket/')).length, 1);
+  assert.equal(harness.calls.some(call => call.url.includes('/storage/v1/object/')), false);
+
+  let sql, lockKey;
+  assert.equal(await adapter.acquirePanditRetentionLock({ one: async (query, key) => { sql = query; lockKey = key; return { locked: true }; } }), true);
+  assert.match(sql, /pg_try_advisory_xact_lock/);
+  assert.equal(lockKey, LOCK_KEY);
   await adapter.close();
 });
 

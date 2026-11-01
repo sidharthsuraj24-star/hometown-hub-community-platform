@@ -5,8 +5,10 @@ const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
 const { DatabaseSync } = require('node:sqlite');
+const sharp = require('sharp');
 const { createFetchHandler } = require('./lib/fetch-handler');
 const { initializePanditSchema, createPanditRoutes } = require('./lib/pandit-onboarding');
+const { createPanditRetentionWorker } = require('./lib/pandit-retention-worker');
 
 const ROOT = __dirname;
 const PUBLIC_DIR = path.join(ROOT, 'public');
@@ -15,6 +17,7 @@ const SESSION_TTL = 7 * 24 * 60 * 60 * 1000;
 const COOKIE_NAME = 'hometown_session';
 const DEFAULT_CATEGORIES = ['General', 'Announcements', 'Culture', 'Events', 'Local Help'];
 const DEFAULT_TAGS = ['Alumni', 'Culture', 'Local Help', 'Local History', 'Food & Traditions'];
+const REGISTRATION_NOTICE = 'If an account can be created with these details, sign in with this email and password. If you already have an account, use the password you previously set.';
 
 class HttpError extends Error {
   constructor(status, message) { super(message); this.status = status; }
@@ -26,6 +29,10 @@ const text = (value, max = 2000) => typeof value === 'string' ? value.trim().sli
 const emailValue = value => text(value, 254).toLowerCase();
 const validEmail = value => /^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(value) && value.length <= 254;
 const safeInt = value => Number.isInteger(Number(value)) ? Number(value) : null;
+function strictBoolean(value, label) {
+  if (typeof value !== 'boolean') fail(400, `${label} must be true or false.`);
+  return value;
+}
 
 function passwordHash(password, salt = crypto.randomBytes(16).toString('hex')) {
   return { salt, hash: crypto.scryptSync(password, salt, 64).toString('hex') };
@@ -132,7 +139,7 @@ function createApp(options = {}) {
     }
   };
   const sessions = isProduction ? null : new Map();
-  const loginAttempts = isProduction ? null : new Map();
+  const rateLimitAttempts = isProduction ? null : new Map();
   let lastRateSweep = 0;
   const headers = {
     'X-Content-Type-Options': 'nosniff', 'X-Frame-Options': 'DENY',
@@ -232,15 +239,24 @@ function createApp(options = {}) {
   }
   function checkOrigin(req) {
     const origin = req.headers.origin;
-    if (!origin) return;
-    try { if (new URL(origin).host !== req.headers.host) fail(403, 'Request origin was not accepted.'); }
+    if (typeof origin !== 'string' || !origin) fail(403, 'Request origin was not accepted.');
+    const fetchSite = String(req.headers['sec-fetch-site'] || '').toLowerCase();
+    if (fetchSite && !['same-origin', 'none'].includes(fetchSite)) fail(403, 'Request origin was not accepted.');
+    try {
+      const parsed = new URL(origin);
+      const forwardedProtocol = String(req.headers['x-forwarded-proto'] || '').split(',')[0].trim().toLowerCase();
+      const protocol = forwardedProtocol || (req.socket?.encrypted ? 'https' : 'http');
+      if (!['http', 'https'].includes(protocol) || !req.headers.host || parsed.username || parsed.password || parsed.pathname !== '/' || parsed.search || parsed.hash) fail(403, 'Request origin was not accepted.');
+      const expected = new URL(`${protocol}://${req.headers.host}`);
+      if (parsed.origin !== expected.origin) fail(403, 'Request origin was not accepted.');
+    }
     catch (error) { if (error instanceof HttpError) throw error; fail(403, 'Request origin was not accepted.'); }
   }
-  async function rateLimit(req, key) {
+  async function rateLimit(req, key, limit = 12) {
     const ip = req.socket.remoteAddress || 'unknown'; const bucket = `${key}:${ip}`;
-    if (isProduction) { if (!(await adapter.rateLimit(bucket))) fail(429, 'Too many attempts. Please wait 15 minutes and try again.'); return; }
-    const time = Date.now(); if (time-lastRateSweep>60000) { lastRateSweep=time; for (const [k,v] of loginAttempts) { const fresh=v.filter(ts=>time-ts<15*60*1000); if (fresh.length) loginAttempts.set(k,fresh); else loginAttempts.delete(k); } }
-    const recent=(loginAttempts.get(bucket)||[]).filter(ts=>time-ts<15*60*1000); if (recent.length>=12) fail(429,'Too many attempts. Please wait 15 minutes and try again.'); recent.push(time); loginAttempts.set(bucket,recent);
+    if (isProduction) { if (!(await adapter.rateLimit(bucket, Date.now(), limit))) fail(429, 'Too many attempts. Please wait 15 minutes and try again.'); return; }
+    const time = Date.now(); if (time-lastRateSweep>60000) { lastRateSweep=time; for (const [k,v] of rateLimitAttempts) { const fresh=v.filter(ts=>time-ts<15*60*1000); if (fresh.length) rateLimitAttempts.set(k,fresh); else rateLimitAttempts.delete(k); } }
+    const recent=(rateLimitAttempts.get(bucket)||[]).filter(ts=>time-ts<15*60*1000); if (recent.length>=limit) fail(429,'Too many attempts. Please wait 15 minutes and try again.'); recent.push(time); rateLimitAttempts.set(bucket,recent);
   }
 
   async function publicUser(userId) {
@@ -382,10 +398,32 @@ function createApp(options = {}) {
 
   const panditTestMode = !isProduction && (options.nodeEnv || env.NODE_ENV) === 'test';
   const allowPanditSimulations = panditTestMode && options.allowPanditSimulations === true;
+  const retentionWorkerEnabled = isProduction ? env.PANDIT_RETENTION_WORKER_ENABLED === 'true' : options.enablePanditRetentionWorker === true;
+  const retentionCronSecret = isProduction ? (typeof env.CRON_SECRET === 'string' ? env.CRON_SECRET : '') :
+    panditTestMode && typeof options.retentionCronSecret === 'string' ? options.retentionCronSecret : '';
+  const validRetentionCronSecret = secret => typeof secret === 'string' && Buffer.byteLength(secret, 'utf8') >= 16 &&
+    Buffer.byteLength(secret, 'utf8') <= 512 && !/\s/.test(secret);
+  const authorizedRetentionCron = req => {
+    if (!validRetentionCronSecret(retentionCronSecret) || typeof req.headers.authorization !== 'string') return false;
+    const expected = Buffer.from(`Bearer ${retentionCronSecret}`, 'utf8');
+    const actual = Buffer.from(req.headers.authorization, 'utf8');
+    return actual.length === expected.length && crypto.timingSafeEqual(actual, expected);
+  };
   const panditStorage = panditTestMode && Object.hasOwn(options, 'panditStorageApi') ?
     require('./lib/pandit-storage-api').createPanditStorageApi({ config: options.panditStorageApi, isProduction, allowSimulations: allowPanditSimulations, nodeEnv: 'test', now: options.panditNow || now, errorFactory: message => new HttpError(503, message) }) :
-    panditTestMode ? options.panditPrivateStorage : null;
+    panditTestMode ? options.panditPrivateStorage : adapter?.panditEvidenceStorage || null;
+  const retentionWorker = createPanditRetentionWorker({
+    transaction,
+    privateEvidenceStorage: panditStorage,
+    isProduction,
+    enabled: retentionWorkerEnabled,
+    allowSimulations: panditTestMode && allowPanditSimulations,
+    acquireLock: adapter?.acquirePanditRetentionLock,
+    now: options.panditNow || now,
+    afterPurge: () => { if (db) db.exec('PRAGMA wal_checkpoint(TRUNCATE)'); },
+  });
   const panditRoutes = createPanditRoutes({ one, many, transaction, requireUser, send, fail, uuid, now: options.panditNow || now, isProduction, afterPurge: () => { if (db) db.exec('PRAGMA wal_checkpoint(TRUNCATE)'); }, allowSimulations: allowPanditSimulations, privateEvidenceStorage: panditStorage,
+    allowProductionEvidence: isProduction && Boolean(adapter?.panditEvidenceStorage),
     // Inline fixtures are explicit/test-only, never a fallback for an unavailable API.
     allowInlineSimulationEvidence: panditTestMode && options.panditInlineSimulationEvidence === true && !Object.hasOwn(options, 'panditStorageApi') });
 
@@ -394,10 +432,23 @@ function createApp(options = {}) {
     let parts;
     try { parts = url.pathname.split('/').filter(Boolean).map(part => decodeURIComponent(part)); }
     catch { fail(400, 'The request path is malformed.'); }
-    if (isProduction && (['pandits','pandit-application'].includes(parts[1]) || parts[1] === 'admin' && parts[2] === 'pandits')) fail(503, 'Pandit onboarding is local-only and requires a separately authorized production release.');
+    if (parts.length === 3 && parts[0] === 'api' && parts[1] === 'internal' && parts[2] === 'pandit-retention') {
+      if (method !== 'GET') { send(res, 405, { error: 'Method not allowed.' }, { Allow: 'GET' }); return true; }
+      if (!validRetentionCronSecret(retentionCronSecret)) fail(503, 'Scheduled retention is not configured.');
+      if (!authorizedRetentionCron(req)) fail(401, 'Unauthorized.');
+      if (!retentionWorkerEnabled || !isProduction && !panditTestMode) fail(503, 'Scheduled retention is disabled.');
+      if (isProduction && (backendError || !adapter)) fail(503, 'The production backend is not available.');
+      const result = await retentionWorker.runOnce();
+      send(res, 200, { ok: true, result });
+      return true;
+    }
+    if (isProduction && !panditStorage && (['pandits','pandit-application'].includes(parts[1]) || parts[1] === 'admin' && parts[2] === 'pandits')) fail(503, 'Pandit evidence Storage is not enabled for production.');
     if (!(method === 'GET' && parts[1] === 'health')) await backendReady();
     if (!parts.length || parts[0] !== 'api') return false;
-    if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(method)) checkOrigin(req);
+    if (['POST', 'PUT', 'PATCH', 'DELETE'].includes(method)) {
+      checkOrigin(req);
+      await rateLimit(req, `write:${method}:${parts[1] || 'root'}`, 60);
+    }
     const body = ['POST', 'PUT', 'PATCH', 'DELETE'].includes(method) ? await readBody(req) : {};
 
     if (await panditRoutes(req, res, parts, body)) return true;
@@ -414,11 +465,9 @@ function createApp(options = {}) {
       if (!validEmail(email)) fail(400, 'Enter a valid email address.');
       if (password.length < 10 || password.length > 128) fail(400, 'Password must be 10–128 characters.');
       if (name.length < 2) fail(400, 'Enter your name.');
-      if (await one('SELECT id FROM users WHERE email = ?', email)) fail(409, 'An account with this email already exists.');
       const id = uuid(), pass = passwordHash(password);
-      await run('INSERT INTO users(id,email,name,password_salt,password_hash,created_at) VALUES(?,?,?,?,?,?)', id, email, name, pass.salt, pass.hash, now());
-      const token = crypto.randomBytes(32).toString('base64url'); if (isProduction) await adapter.createSession(id, token); else sessions.set(token, { userId: id, expires: Date.now() + SESSION_TTL });
-      const createdUser = await publicUser(id); send(res, 201, { user: { ...createdUser, email, role: 'user' } }, { 'Set-Cookie': cookie(token) }); return true;
+      await run('INSERT INTO users(id,email,name,password_salt,password_hash,created_at) VALUES(?,?,?,?,?,?) ON CONFLICT(email) DO NOTHING', id, email, name, pass.salt, pass.hash, now());
+      send(res, 202, { message: REGISTRATION_NOTICE }); return true;
     }
     if (method === 'POST' && parts[1] === 'auth' && parts[2] === 'login') {
       await rateLimit(req, 'login');
@@ -527,12 +576,28 @@ function createApp(options = {}) {
         if (!match) fail(400, 'Upload a PNG, JPEG, or WebP image.');
         const buffer = Buffer.from(match[2], 'base64');
         if (buffer.length > 1_500_000) fail(413, 'Image must be 1.5 MB or smaller.');
-        const signatures = { 'image/png': buffer.subarray(0, 8).equals(Buffer.from([137,80,78,71,13,10,26,10])), 'image/jpeg': buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff, 'image/webp': buffer.toString('ascii', 0, 4) === 'RIFF' && buffer.toString('ascii', 8, 12) === 'WEBP' };
-        if (!signatures[match[1]]) fail(400, 'The image file format could not be verified.');
+        if (buffer.toString('base64').replace(/=+$/, '') !== match[2].replace(/=+$/, '')) fail(400, 'The image file format could not be verified.');
+        const expectedFormat = { 'image/png': 'png', 'image/jpeg': 'jpeg', 'image/webp': 'webp' }[match[1]];
+        let normalized;
+        try {
+          const metadata = await sharp(buffer, { failOn: 'error', limitInputPixels: 40_000_000, sequentialRead: true }).metadata();
+          if (metadata.format !== expectedFormat) fail(400, 'The image file format could not be verified.');
+          let pipeline = sharp(buffer, { failOn: 'error', limitInputPixels: 40_000_000, sequentialRead: true })
+            .rotate()
+            .resize({ width: 2400, height: 2400, fit: 'inside', withoutEnlargement: true });
+          if (expectedFormat === 'jpeg') pipeline = pipeline.jpeg({ quality: 82, progressive: true });
+          else if (expectedFormat === 'webp') pipeline = pipeline.webp({ quality: 82, effort: 4 });
+          else pipeline = pipeline.png({ compressionLevel: 9, adaptiveFiltering: true });
+          normalized = await pipeline.toBuffer();
+        } catch (error) {
+          if (error instanceof HttpError) throw error;
+          fail(400, 'The image could not be decoded safely.');
+        }
+        if (normalized.length > 1_500_000) fail(413, 'Image must be 1.5 MB or smaller after processing.');
         const ext = match[1] === 'image/jpeg' ? 'jpg' : match[1].split('/')[1];
         const filename = `${uuid()}.${ext}`; imagePath = `/uploads/${filename}`;
-        if (isProduction) await adapter.upload(filename, buffer, match[1]);
-        else fs.writeFileSync(path.join(uploadDir, filename), buffer, { flag: 'wx' });
+        if (isProduction) await adapter.upload(filename, normalized, match[1]);
+        else fs.writeFileSync(path.join(uploadDir, filename), normalized, { flag: 'wx' });
       }
       const id = uuid();
       try { await run('INSERT INTO posts(id,community_id,user_id,body,category,kind,image_path,created_at) VALUES(?,?,?,?,?,?,?,?)', id, communityId, user.id, content, category, kind, imagePath, now()); }
@@ -748,7 +813,7 @@ function createApp(options = {}) {
     if (method === 'POST' && parts[1] === 'admin' && parts[2] === 'users' && parts[3] && parts[4] === 'status') {
       const admin = await requireAdmin(req), target = await one('SELECT id,role,disabled FROM users WHERE id=?', parts[3]);
       if (!target) fail(404, 'User not found.'); if (target.id === admin.id || target.role === 'admin') fail(400, 'Platform administrator accounts cannot be disabled here.');
-      const disabled = Boolean(body.disabled); await run('UPDATE users SET disabled=? WHERE id=?', isProduction ? disabled : (disabled ? 1 : 0), target.id);
+      const disabled = strictBoolean(body.disabled, 'Disabled status'); await run('UPDATE users SET disabled=? WHERE id=?', isProduction ? disabled : (disabled ? 1 : 0), target.id);
       if (disabled && isProduction) await run('DELETE FROM app_sessions WHERE user_id=?', target.id); else if (disabled) for (const [token, session] of sessions) if (session.userId === target.id) sessions.delete(token);
       send(res, 200, { disabled }); return true;
     }
@@ -853,6 +918,8 @@ function createApp(options = {}) {
   server.maxHeadersCount = 100;
   server.handle = handle;
   server.database = db || adapter;
+  // Internal/test hook; production HTTP invocation uses the authenticated route above.
+  server.runPanditRetentionWorker = () => retentionWorker.runOnce();
   server.closeDatabase = () => { if (db) db.close(); else if (adapter) return adapter.close(); };
   server.appOptions = { dataDir, uploadDir, dbPath };
   return server;

@@ -335,7 +335,14 @@ async function formSubmit(form, submitter = null) {
     }
     if(kind==='auth'){
       const mode=value.mode;
-      const result=await post(`/api/auth/${mode}`,{name:value.name,email:value.email,password:value.password}); state.user=result.user; await loadCommon(); applyDeepLink(); toast(mode==='register'?'Welcome to Hometown Hub.':'You’re signed in.'); await loadPage(); if(location.hash)window.dispatchEvent(new Event('hashchange'));
+      if(mode==='register'){
+        const result=await post('/api/auth/register',{name:value.name,email:value.email,password:value.password});
+        state.authMode='login'; render();
+        const intro=$('.auth-card > p'); if(intro){intro.textContent=result.message;intro.setAttribute('role','status');intro.setAttribute('aria-live','polite');}
+        const email=$('#auth-email'); if(email){email.value=value.email;email.focus();}
+        return;
+      }
+      const result=await post('/api/auth/login',{email:value.email,password:value.password}); state.user=result.user; await loadCommon(); applyDeepLink(); toast('You’re signed in.'); await loadPage(); if(location.hash)window.dispatchEvent(new Event('hashchange'));
     }
     if(kind==='create-community'){
       const tags=[...form.elements.tags.selectedOptions].map(option=>option.value);

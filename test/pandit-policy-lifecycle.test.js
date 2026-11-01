@@ -23,7 +23,7 @@ async function setup(t, start = '2032-02-29T12:34:56.789Z') {
     const cookie = r.headers.get('set-cookie'); if (cookie) client.cookie = cookie.split(';')[0];
     return { status: r.status, data: await r.json().catch(() => ({})), headers: r.headers };
   };
-  const register = async label => { const c = {}; const r = await call(c, '/api/auth/register', 'POST', { name: 'SYNTHETIC TEST ACTOR - NOT A PERSON', email: `synthetic-${label}@example.test`, password: 'synthetic-member-password-123' }); assert.equal(r.status, 201); c.id = r.data.user.id; return c; };
+  const register = async label => { const c = {}; const email = `synthetic-${label}@example.test`; const password = 'synthetic-member-password-123'; const r = await call(c, '/api/auth/register', 'POST', { name: 'SYNTHETIC TEST ACTOR - NOT A PERSON', email, password }); assert.equal(r.status, 202); assert.equal(r.headers.get('set-cookie'), null); const login = await call(c, '/api/auth/login', 'POST', { email, password }); assert.equal(login.status, 200); c.id = login.data.user.id; return c; };
   const admin = {}; assert.equal((await call(admin, '/api/auth/login', 'POST', { email: 'admin@example.test', password: 'synthetic-admin-password-123' })).status, 200);
   const checker = await register('checker'), compliance = await register('compliance');
   for (const [actor, role] of [[checker, 'CHECKER'], [compliance, 'COMPLIANCE']]) assert.equal((await call(admin, '/api/admin/pandits/roles', 'POST', { user_id: actor.id, role })).status, 200);
@@ -105,7 +105,60 @@ test('production and disabled-simulation expiry fail closed before mutation; eve
   const disabled = make({}); await disabled.route({ method: 'GET' }, {}, ['', 'pandits'], {}); assert.equal(disabled.effects.transactions, 0); assert.equal(disabled.effects.sends[0].status, 200);
   const production = make({ isProduction: true, allowSimulations: true, requireUser: async () => { throw new Error('Production gate must precede auth and adapters'); } });
   await assert.rejects(production.route({ method: 'GET' }, {}, ['', 'pandits'], {}), error => error.status === 503); assert.equal(production.effects.transactions, 0); assert.deepEqual(production.effects.queries, []);
+  const released = make({ isProduction: true, allowProductionEvidence: true });
+  await released.route({ method: 'GET' }, {}, ['', 'pandits'], {});
+  assert.equal(released.effects.sends[0].status, 200, 'the production handler opens only with its explicit storage-backed release flag');
+  assert.match(released.effects.queries[0], /p\.is_simulation=0/, 'the production directory excludes synthetic records');
+  assert.equal(released.effects.transactions, 0, 'production reads never invoke the synthetic retention sweep');
   const enabled = make({ allowSimulations: true }); await enabled.route({ method: 'GET' }, {}, ['', 'pandits'], {}); assert.equal(enabled.effects.transactions, 1); assert.equal(enabled.effects.queries.filter(sql => /\bis_simulation=1\b/.test(sql)).length, 3);
+});
+
+test('production evidence scope requires the connector flag and excludes simulation records', async () => {
+  const { createPanditRoutes } = require('../lib/pandit-onboarding');
+  const owner = { id: 'synthetic-production-owner' };
+  const retentionPolicy = { approved_retention_years: 3, approved_retention_days: null, pending_evidence_retention_days: 90,
+    rejected_evidence_retention_days: 90, rejected_background_check_retention_days: 90, rejected_education_retention_days: 90,
+    appeal_days: 30, recheck_years: 2 };
+  const body = { revision: 1, action: 'submit', display_name: 'Synthetic Applicant', location: 'Synthetic town',
+    description: 'Synthetic description long enough for the route check.', traditions: 'Synthetic tradition',
+    languages: 'Synthetic language', ritual_skills: 'Synthetic ritual skills', experience_years: 5 };
+  const makeRoute = (allowProductionEvidence, isSimulation) => {
+    const effects = { transactions: 0, writes: 0 };
+    const application = { id: 'synthetic-application', user_id: owner.id, is_simulation: isSimulation, status: 'ACTION_REQUIRED', revision: 1 };
+    const tx = {
+      one: async sql => {
+        if (sql.includes('FROM pandit_policy')) return retentionPolicy;
+        if (sql.includes('SELECT disabled FROM users')) return { disabled: false };
+        if (sql.includes('SELECT * FROM pandit_applications WHERE user_id=?')) return application;
+        throw new Error(`Unexpected synthetic query: ${sql}`);
+      },
+      many: async sql => {
+        if (sql.includes('SELECT kind FROM pandit_evidence')) return [];
+        throw new Error(`Unexpected synthetic query: ${sql}`);
+      },
+      run: async () => { effects.writes += 1; return { rowCount: 1 }; },
+    };
+    const route = createPanditRoutes({
+      one: async sql => { if (sql.includes('FROM pandit_policy')) return retentionPolicy; throw new Error(`Unexpected synthetic query: ${sql}`); },
+      many: async () => [], transaction: async callback => { effects.transactions += 1; return callback(tx); },
+      requireUser: async () => owner, send: () => {}, fail: (status, message) => { throw Object.assign(new Error(message), { status }); },
+      uuid: () => 'synthetic-audit-id', now: () => '2035-02-28T12:34:56.789Z', isProduction: true,
+      allowProductionEvidence, allowSimulations: false,
+    });
+    return { effects, route };
+  };
+
+  const locked = makeRoute(false, 0);
+  await assert.rejects(locked.route({ method: 'POST' }, {}, ['', 'pandit-application'], body), error => error.status === 503);
+  assert.equal(locked.effects.transactions, 0);
+
+  const releasedRealRecord = makeRoute(true, 0);
+  await assert.rejects(releasedRealRecord.route({ method: 'POST' }, {}, ['', 'pandit-application'], body), error => error.status === 400);
+  assert.equal(releasedRealRecord.effects.writes, 0, 'missing private evidence blocks submission without persistence');
+
+  const releasedSimulation = makeRoute(true, 1);
+  await assert.rejects(releasedSimulation.route({ method: 'POST' }, {}, ['', 'pandit-application'], body), error => error.status === 503);
+  assert.equal(releasedSimulation.effects.writes, 0, 'production access never admits synthetic applications');
 });
 
 test('pending evidence uses the last successful applicant mutation and expires at exact 90 elapsed UTC days', async t => {

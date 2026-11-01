@@ -12,7 +12,8 @@ const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pandit-pg-'));
 const data = path.join(root, 'data');
 const socket = path.join(root, 'socket');
 const log = path.join(root, 'postgres.log');
-const migration = path.resolve(__dirname, '../supabase/migrations/004_pandit_onboarding.sql');
+const migration004 = path.resolve(__dirname, '../supabase/migrations/004_pandit_onboarding.sql');
+const migration005 = path.resolve(__dirname, '../supabase/migrations/005_pandit_storage_uploads.sql');
 let started = false;
 function command(file, args, input, options = {}) {
   const result = spawnSync(file, args, { input, encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, ...options });
@@ -78,8 +79,9 @@ try {
     ALTER TABLE storage.objects ENABLE ROW LEVEL SECURITY;
   `);
   const before = snapshot();
-  const migrationSql = fs.readFileSync(migration, 'utf8');
-  r = psql('BEGIN;\n' + migrationSql + '\nCOMMIT;\n', 'app_owner');
+  const migration004Sql = fs.readFileSync(migration004, 'utf8');
+  const migration005Sql = fs.readFileSync(migration005, 'utf8');
+  r = psql('BEGIN;\n' + migration004Sql + '\nCOMMIT;\n', 'app_owner');
   assert.equal(r.status, 0, `migration must execute as app schema owner: ${r.stderr}`);
   const after = snapshot();
   assert.deepEqual(after, before, 'provider storage ownership, RLS, policies, and data must be unchanged');
@@ -91,6 +93,16 @@ try {
   assert.equal(query("SELECT count(*) FROM pandit_reviews"), '0');
   assert.equal(query("SELECT count(*) FROM pg_policies WHERE schemaname='public' AND tablename LIKE 'pandit_%'"), '0');
   assert.equal(query("SELECT count(*) FROM pg_class WHERE relnamespace='public'::regnamespace AND relname LIKE 'pandit_%' AND relrowsecurity"), '5');
+  const before005 = snapshot();
+  r = psql('BEGIN;\n' + migration005Sql + '\nCOMMIT;\n', 'app_owner');
+  assert.equal(r.status, 0, `migration 005 must execute as app schema owner: ${r.stderr}`);
+  assert.deepEqual(snapshot(), before005, 'migration 005 must not alter provider Storage ownership, RLS, policies, or data');
+  assert.equal(query("SELECT count(*) FROM pg_tables WHERE schemaname='public' AND tablename LIKE 'pandit_%'"), '6');
+  assert.equal(query('SELECT count(*) FROM pandit_storage_uploads'), '0');
+  assert.equal(query("SELECT relrowsecurity FROM pg_class WHERE oid='pandit_storage_uploads'::regclass"), 't');
+  assert.equal(query("SELECT count(*) FROM pg_policies WHERE schemaname='public' AND tablename='pandit_storage_uploads'"), '0');
+  assert.equal(query("SELECT count(*) FROM pg_indexes WHERE schemaname='public' AND tablename='pandit_storage_uploads' AND indexname IN ('pandit_storage_uploads_pkey','idx_pandit_storage_uploads_due','pandit_storage_uploads_storage_path_key')"), '3');
+  assert.equal(query("SELECT count(*) FROM pg_class WHERE relnamespace='public'::regnamespace AND relname LIKE 'pandit_%' AND relrowsecurity"), '6');
   assert.equal(query("SELECT has_table_privilege('app_owner','storage.objects','SELECT') OR has_table_privilege('app_owner','storage.buckets','SELECT')"), 'f');
   // Synthetic valid rows exercise the intended shape; each invalid case is isolated and rolled back.
   const validRows = `
@@ -101,6 +113,7 @@ try {
     INSERT INTO pandit_roles VALUES ('00000000-0000-0000-0000-000000000011','CHECKER');
     INSERT INTO pandit_policy (id,approved_retention_days) VALUES (1,30);
     INSERT INTO pandit_reviews (application_id,actor_id,event) VALUES ('00000000-0000-0000-0000-000000000011','00000000-0000-0000-0000-000000000011','submitted');
+    INSERT INTO pandit_storage_uploads (id,application_id,kind,content_type,storage_path,retention_basis,delete_after) VALUES ('00000000-0000-0000-0000-000000000012','00000000-0000-0000-0000-000000000011','GOVERNMENT_ID','application/pdf','synthetic/pending-upload.pdf','PENDING','2035-01-01T00:00:00Z');
     ROLLBACK;`;
   must(validRows);
   const invalidRows = [
@@ -120,13 +133,15 @@ try {
   for (const role of ['anon', 'authenticated']) {
     r = psql('SELECT count(*) FROM pandit_applications;', role);
     assert.notEqual(r.status, 0, `${role} must be denied app-table access after migration revokes`);
+    r = psql('SELECT count(*) FROM pandit_storage_uploads;', role);
+    assert.notEqual(r.status, 0, `${role} must be denied upload-journal access after migration revokes`);
   }
-  must('GRANT SELECT ON pandit_applications, pandit_evidence, pandit_roles, pandit_policy, pandit_reviews TO anon, authenticated;');
+  must('GRANT SELECT ON pandit_applications, pandit_evidence, pandit_roles, pandit_policy, pandit_reviews, pandit_storage_uploads TO anon, authenticated;');
   for (const role of ['anon', 'authenticated']) {
-    const probe = validRows.replace('ROLLBACK;', `SET LOCAL ROLE ${role}; SELECT count(*) FROM pandit_applications; SELECT count(*) FROM pandit_evidence; ROLLBACK;`);
-    assert.equal(must(probe, 'postgres', ['-qAt']), '0\n0', `${role} cannot see existing synthetic app/evidence rows under default-deny RLS`);
+    const probe = validRows.replace('ROLLBACK;', `SET LOCAL ROLE ${role}; SELECT count(*) FROM pandit_applications; SELECT count(*) FROM pandit_evidence; SELECT count(*) FROM pandit_storage_uploads; ROLLBACK;`);
+    assert.equal(must(probe, 'postgres', ['-qAt']), '0\n0\n0', `${role} cannot see synthetic app/evidence/journal rows under default-deny RLS`);
   }
-  must('REVOKE SELECT ON pandit_applications, pandit_evidence, pandit_roles, pandit_policy, pandit_reviews FROM anon, authenticated;');
+  must('REVOKE SELECT ON pandit_applications, pandit_evidence, pandit_roles, pandit_policy, pandit_reviews, pandit_storage_uploads FROM anon, authenticated;');
   // Re-grant disposable fixture table privileges so default-deny RLS, rather than ACLs, is tested.
   must('GRANT SELECT, INSERT, UPDATE, DELETE ON storage.objects TO anon, authenticated;', 'provider_owner');
   for (const role of ['anon', 'authenticated']) {
@@ -144,10 +159,14 @@ try {
   }
   // A rerun is intentionally rejected, but its transaction must leave the first install unchanged.
   const rerunBefore = snapshot();
-  r = psql('BEGIN;\n' + migrationSql + '\nCOMMIT;\n', 'app_owner');
+  r = psql('BEGIN;\n' + migration004Sql + '\nCOMMIT;\n', 'app_owner');
   assert.notEqual(r.status, 0, 'fresh-only migration rerun must fail');
   assert.deepEqual(snapshot(), rerunBefore, 'failed rerun must roll back transactionally');
-  console.log('PASS: 18 assertion categories: immutable app-owner migration/storage snapshot, app constraints, client revokes, default-deny storage RLS fixture, anon/auth object SELECT/INSERT/UPDATE/DELETE behavior, and transactional migration rerun rollback verified. Broad/restrictive production policy behavior is intentionally untested; no storage policy DDL is executed.');
+  const journalBefore = query('SELECT count(*) FROM pandit_storage_uploads');
+  r = psql('BEGIN;\n' + migration005Sql + '\nCOMMIT;\n', 'app_owner');
+  assert.notEqual(r.status, 0, 'migration 005 rerun must fail');
+  assert.equal(query('SELECT count(*) FROM pandit_storage_uploads'), journalBefore, 'failed migration 005 rerun must leave the journal unchanged');
+  console.log('PASS: disposable PostgreSQL validation covered migrations 004/005, upload-journal empty state/indexes/RLS/revokes, app constraints, unchanged provider Storage, anon/auth default-deny behavior, and transactional rerun failures. Broad/restrictive production Storage policies remain untested; no Storage policy DDL is executed.');
 } finally {
   cleanup();
 }
