@@ -4,7 +4,7 @@
   "private": true,
   "description": "A responsive hometown community platform with moderation and event RSVPs.",
   "engines": {
-    "node": ">=22.13.0"
+    "node": "24.x"
   },
   "scripts": {
     "start": "node --env-file-if-exists=.env server.js",
