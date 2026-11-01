@@ -1,6 +1,6 @@
 # Hometown Hub
 
-A responsive web platform for people who want to stay connected to their hometown or local community. Hometown Hub provides community feeds, member-led events, moderation, and platform administration without preloaded fictional activity.
+A responsive web platform for people who want to stay connected to their hometown or local community. Hometown Hub provides community feeds, member-led events, moderation, and platform administration without preloaded fictional activity. Release branch: host/supabase-vercel.
 
 ## Implemented
 
