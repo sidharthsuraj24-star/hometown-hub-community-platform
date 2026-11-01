@@ -6,6 +6,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { createApp } = require('../server');
+const sharp = require('sharp');
 
 async function fixture(t) {
   const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hometown-hub-test-'));
@@ -32,8 +33,11 @@ async function call(ctx, client, url, method = 'GET', body) {
   return { response, data };
 }
 async function register(ctx, client, name, email) {
-  const result = await call(ctx, client, '/api/auth/register', 'POST', { name, email, password: 'member-password-123' });
-  assert.equal(result.response.status, 201, JSON.stringify(result.data));
+  const signup = await call(ctx, client, '/api/auth/register', 'POST', { name, email, password: 'member-password-123' });
+  assert.equal(signup.response.status, 202, JSON.stringify(signup.data));
+  assert.equal(signup.response.headers.get('set-cookie'), null, 'signup does not establish a session');
+  const result = await call(ctx, client, '/api/auth/login', 'POST', { email, password: 'member-password-123' });
+  assert.equal(result.response.status, 200, JSON.stringify(result.data));
   client.email = email;
   client.userId = result.data.user.id;
   return result.data.user;
@@ -87,6 +91,57 @@ test('account registration and platform admin bootstrap use an empty database', 
   assert.equal(refreshed.data.user.hometown, 'Example Village');
 });
 
+test('community post images are decoded, re-encoded, orientation-corrected, and stripped of metadata', async t => {
+  const ctx = await fixture(t), admin = ctx.admin, owner = { cookie: '' };
+  await loginAdmin(ctx, admin);
+  await register(ctx, owner, 'Image Owner', 'image-owner@example.test');
+  const communityId = await createApprovedCommunity(ctx, owner, admin);
+  const source = await sharp({ create: { width: 8, height: 4, channels: 3, background: { r: 120, g: 80, b: 40 } } })
+    .withMetadata({ orientation: 6 }).jpeg({ quality: 90 }).toBuffer();
+  assert.ok((await sharp(source).metadata()).exif, 'fixture contains EXIF metadata');
+  const post = await call(ctx, owner, '/api/posts', 'POST', {
+    community_id: communityId, body: 'Synthetic image sanitization check.', category: 'General',
+    image: `data:image/jpeg;base64,${source.toString('base64')}`
+  });
+  assert.equal(post.response.status, 201, JSON.stringify(post.data));
+  const feed = await call(ctx, owner, `/api/feed?community=${communityId}`);
+  const imageResponse = await fetch(`${ctx.base}${feed.data.posts[0].image_path}`, { headers: { Cookie: owner.cookie } });
+  assert.equal(imageResponse.status, 200);
+  assert.equal(imageResponse.headers.get('content-type'), 'image/jpeg');
+  const stored = Buffer.from(await imageResponse.arrayBuffer());
+  const metadata = await sharp(stored).metadata();
+  assert.equal(metadata.format, 'jpeg');
+  assert.equal(metadata.exif, undefined, 'stored image metadata is stripped');
+  assert.equal(metadata.width, 4, 'EXIF orientation is applied during re-encoding');
+  assert.equal(metadata.height, 8);
+
+  const fakePng = Buffer.concat([Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]), Buffer.from('not a decodable PNG')]);
+  const rejected = await call(ctx, owner, '/api/posts', 'POST', {
+    community_id: communityId, body: 'Malformed image should not persist.', category: 'General',
+    image: `data:image/png;base64,${fakePng.toString('base64')}`
+  });
+  assert.equal(rejected.response.status, 400);
+  assert.equal((await call(ctx, owner, `/api/feed?community=${communityId}`)).data.posts.length, 1);
+});
+
+test('admin account disabled status accepts JSON booleans only', async t => {
+  const ctx = await fixture(t), admin = ctx.admin, member = { cookie: '' };
+  await loginAdmin(ctx, admin);
+  const user = await register(ctx, member, 'Disable Test Member', 'disable-test@example.test');
+  const endpoint = `/api/admin/users/${user.id}/status`;
+  const invalid = await call(ctx, admin, endpoint, 'POST', { disabled: 'false' });
+  assert.equal(invalid.response.status, 400);
+  assert.ok((await call(ctx, member, '/api/me')).data.user, 'invalid input leaves the member active');
+  const disabled = await call(ctx, admin, endpoint, 'POST', { disabled: true });
+  assert.equal(disabled.response.status, 200, JSON.stringify(disabled.data));
+  assert.equal(disabled.data.disabled, true);
+  assert.equal((await call(ctx, member, '/api/me')).data.user, null, 'disabling revokes the existing session');
+  const enabled = await call(ctx, admin, endpoint, 'POST', { disabled: false });
+  assert.equal(enabled.response.status, 200, JSON.stringify(enabled.data));
+  assert.equal(enabled.data.disabled, false);
+  assert.equal((await call(ctx, member, '/api/auth/login', 'POST', { email: 'disable-test@example.test', password: 'member-password-123' })).response.status, 200);
+});
+
 test('community requests require platform review and member approval; moderators can pin posts', async t => {
   const ctx = await fixture(t), admin = ctx.admin, owner = { cookie: '' }, member = { cookie: '' }, outsider = { cookie: '' };
   await loginAdmin(ctx, admin);
@@ -95,7 +150,8 @@ test('community requests require platform review and member approval; moderators
   await register(ctx, outsider, 'Non-member', 'outsider@example.test');
   const communityId = await createApprovedCommunity(ctx, owner, admin);
   await joinAndApprove(ctx, member, owner, communityId);
-  const post = await call(ctx, member, '/api/posts', 'POST', { community_id: communityId, body: 'A useful local update for the group.', category: 'General', kind: 'announcement', image: 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/0Z0AAAAASUVORK5CYII=' });
+  const validPng = await sharp({ create: { width: 4, height: 4, channels: 3, background: { r: 40, g: 100, b: 180 } } }).png().toBuffer();
+  const post = await call(ctx, member, '/api/posts', 'POST', { community_id: communityId, body: 'A useful local update for the group.', category: 'General', kind: 'announcement', image: `data:image/png;base64,${validPng.toString('base64')}` });
   assert.equal(post.response.status, 201, JSON.stringify(post.data));
   const unauthorizedPin = await call(ctx, member, `/api/posts/${post.data.id}/pin`, 'POST', { pinned: true });
   assert.equal(unauthorizedPin.response.status, 403);

@@ -34,7 +34,10 @@ async function call(ctx, client, url, method = 'GET', body) {
 }
 async function register(ctx, email, name = 'Synthetic User') {
   const c = { cookie: '' }; const r = await call(ctx, c, '/api/auth/register', 'POST', { name, email, password: 'member-password-123' });
-  assert.equal(r.response.status, 201, JSON.stringify(r.data)); c.userId = r.data.user.id; return c;
+  assert.equal(r.response.status, 202, JSON.stringify(r.data));
+  assert.equal(r.response.headers.get('set-cookie'), null);
+  const login = await call(ctx, c, '/api/auth/login', 'POST', { email, password: 'member-password-123' });
+  assert.equal(login.response.status, 200, JSON.stringify(login.data)); c.userId = login.data.user.id; return c;
 }
 async function loginAdmin(ctx) { const c = { cookie: '' }; const r = await call(ctx, c, '/api/auth/login', 'POST', { email: 'admin@example.test', password: 'test-admin-password-123' }); assert.equal(r.response.status, 200); c.userId = r.data.user.id; return c; }
 function profile(revision, action = 'save', extra = {}) { return { ...PROFILE, revision, action, is_simulation: true, ...extra }; }
@@ -116,7 +119,7 @@ async function evidence(ctx, c, revision, kind, extra = {}) { return call(ctx, c
 
 function dbInsertUser(db, id) { const { salt, hash } = require('../server').passwordHash('synthetic-password-123'); db.prepare('INSERT INTO users(id,email,name,password_salt,password_hash,created_at) VALUES(?,?,?,?,?,?)').run(id, `${id}@example.test`, SYNTHETIC, salt, hash, new Date().toISOString()); }
 
-test('production Pandit endpoints are an unconditional 503 without adapter access', async t => {
+test('production Pandit endpoints stay locked when the dedicated storage connector is absent', async t => {
   const ctx = await fixture(t, { nodeEnv: 'production', env: {}, dataDir: fs.mkdtempSync(path.join(os.tmpdir(), 'hometown-prod-test-')) });
   for (const [url, method] of [['/api/pandits','GET'], ['/api/pandit-application','GET'], ['/api/admin/pandits','GET'], ['/api/pandit-application','POST']]) assert.equal((await call(ctx, { cookie: '' }, url, method, profile(0))).response.status, 503);
 });

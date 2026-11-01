@@ -26,7 +26,9 @@ async function setup(t, options = {}) {
   const admin = {}, member = {};
   assert.equal((await call(admin, '/api/auth/login', 'POST', { email: 'admin@example.test', password: 'synthetic-admin-password-123' })).status, 200);
   const registered = await call(member, '/api/auth/register', 'POST', { name: 'SYNTHETIC INTEGRATION ACTOR - NOT A PERSON', email: 'synthetic-integration@example.test', password: 'synthetic-member-password-123' });
-  assert.equal(registered.status, 201); member.id = registered.data.user.id;
+  assert.equal(registered.status, 202); assert.equal(registered.data.message, 'If an account can be created with these details, sign in with this email and password. If you already have an account, use the password you previously set.');
+  const signedIn = await call(member, '/api/auth/login', 'POST', { email: 'synthetic-integration@example.test', password: 'synthetic-member-password-123' });
+  assert.equal(signedIn.status, 200); member.id = signedIn.data.user.id;
   return { app, db: app.database, call, admin, member, invoke };
 }
 function seed(f, { simulation = 1, status = 'ACTION_REQUIRED', approved = null, rejected = null } = {}) {
@@ -138,7 +140,7 @@ test('non-simulation rows are not deleted even when explicitly enabled simulatio
 test('private object downloads use current reviewer authorization, no public URL, and attachment-only responses', async t => {
   const { createPanditPrivateStorage, BUCKET } = require('../lib/pandit-private-storage');
   const calls = [];
-  const bytes = Buffer.from('SYNTHETIC PRIVATE ATTACHMENT ONLY');
+  const bytes = Buffer.from('%PDF-1.4\nSYNTHETIC PRIVATE ATTACHMENT ONLY\n%%EOF');
   const helper = createPanditPrivateStorage({ allowSimulations: true, storage: { from: bucket => {
     assert.equal(bucket, BUCKET);
     return { upload: async () => { throw new Error('No upload expected'); }, remove: async () => { throw new Error('No removal expected'); }, download: async key => { calls.push(key); return { data: new Blob([bytes]), error: null }; } };
@@ -151,7 +153,10 @@ test('private object downloads use current reviewer authorization, no public URL
   f.db.prepare('UPDATE pandit_evidence SET content_base64=NULL,storage_path=?,delete_after=NULL WHERE id=?').run(key, eid);
   const reviewer = {};
   const r = await f.call(reviewer, '/api/auth/register', 'POST', { name: 'SYNTHETIC CHECKER - NOT A PERSON', email: 'synthetic-private-checker@example.test', password: 'synthetic-checker-password-123' });
-  assert.equal(r.status, 201); reviewer.id = r.data.user.id;
+  assert.equal(r.status, 202);
+  assert.equal(r.data.message, 'If an account can be created with these details, sign in with this email and password. If you already have an account, use the password you previously set.');
+  const signedIn = await f.call(reviewer, '/api/auth/login', 'POST', { email: 'synthetic-private-checker@example.test', password: 'synthetic-checker-password-123' });
+  assert.equal(signedIn.status, 200); reviewer.id = signedIn.data.user.id;
   const route = `/api/admin/pandits/${id}/evidence/${eid}`;
   for (const client of [f.admin, f.member, reviewer]) assert.equal((await f.call(client, route)).status, 403);
   assert.equal(calls.length, 0);

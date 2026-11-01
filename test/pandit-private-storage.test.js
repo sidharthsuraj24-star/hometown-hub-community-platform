@@ -9,14 +9,15 @@ const evidenceId = '22222222-2222-4222-8222-222222222222';
 const ownerId = '33333333-3333-4333-8333-333333333333';
 const reviewerId = '44444444-4444-4444-8444-444444444444';
 const NOW = '2035-01-01T00:00:00.000Z';
+const VALID_PDF = Buffer.from('%PDF-1.4\nSYNTHETIC PRIVATE STORAGE TEST ONLY\n%%EOF');
 const app = (extra = {}) => ({ id: applicationId, user_id: ownerId, is_simulation: 1, submitted_at: NOW, status: 'PENDING_VERIFICATION', ...extra });
 const evidence = (extra = {}) => ({ id: evidenceId, application_id: applicationId, kind: 'GOVERNMENT_ID', content_type: 'application/pdf', storage_path: `${applicationId}/${evidenceId}`, delete_after: '2035-02-01T00:00:00.000Z', retention_basis: 'APPROVED', ...extra });
 const actor = (extra = {}) => ({ id: reviewerId, disabled: false, ...extra });
-function mockStorage() {
+function mockStorage(downloadData = VALID_PDF) {
   const calls = [];
   const bucket = {
     async upload(...args) { calls.push(['upload', ...args]); return { data: { path: args[0] }, error: null }; },
-    async download(...args) { calls.push(['download', ...args]); return { data: Buffer.from('private'), error: null }; },
+    async download(...args) { calls.push(['download', ...args]); return { data: downloadData, error: null }; },
     async remove(...args) { calls.push(['remove', ...args]); return { data: [], error: null }; },
   };
   return { calls, storage: { from(name) { calls.push(['from', name]); return bucket; } } };
@@ -50,7 +51,7 @@ test('get requires an active non-owner checker/compliance reviewer and submitted
   const mock = mockStorage();
   const helper = createPanditPrivateStorage({ storage: mock.storage, allowSimulations: true, now: NOW });
   const params = { application: app(), evidence: evidence(), actor: actor(), role: 'CHECKER' };
-  assert.deepEqual(await helper.get(params), Buffer.from('private'));
+  assert.deepEqual(await helper.get(params), VALID_PDF);
   for (const denied of [
     { role: 'SUPER_ADMIN' }, { role: 'CHECKER', actor: actor({ id: ownerId }) },
     { role: 'COMPLIANCE', actor: actor({ disabled: true }) },
@@ -63,6 +64,23 @@ test('get requires an active non-owner checker/compliance reviewer and submitted
   ]) await assert.rejects(() => helper.get({ ...params, ...denied }));
   const downloads = mock.calls.filter(call => call[0] === 'download');
   assert.equal(downloads.length, 1);
+});
+
+test('get rejects empty, corrupt, mismatched-type, and oversized stored evidence', async () => {
+  const invalid = [
+    { content_type: 'application/pdf', bytes: Buffer.alloc(0) },
+    { content_type: 'application/pdf', bytes: Buffer.from('not a PDF') },
+    { content_type: 'image/png', bytes: VALID_PDF },
+    { content_type: 'application/pdf', bytes: Buffer.alloc(1048577, 0x41) },
+  ];
+  for (const { content_type, bytes } of invalid) {
+    const mock = mockStorage(bytes);
+    const helper = createPanditPrivateStorage({ storage: mock.storage, allowSimulations: true, now: NOW });
+    await assert.rejects(() => helper.get({
+      application: app(), evidence: evidence({ content_type }), actor: actor(), role: 'CHECKER',
+    }), /download/);
+    assert.equal(mock.calls.filter(call => call[0] === 'download').length, 1);
+  }
 });
 
 test('removeExpired enforces policy and due-time boundary; failed removal is observable while missing is idempotent', async () => {

@@ -26,9 +26,11 @@ async function fixture(t, options = {}) {
 }
 
 async function request(base, client, pathName, method = 'GET', body, extra = {}) {
-  const headers = { ...(client?.cookie ? { Cookie: client.cookie } : {}), ...extra };
+  const { omitOrigin = false, ...extraHeaders } = extra;
+  const headers = { ...(client?.cookie ? { Cookie: client.cookie } : {}), ...extraHeaders };
   if (method !== 'GET' && method !== 'HEAD') {
-    headers.Origin ??= base;
+    if (omitOrigin) delete headers.Origin;
+    else headers.Origin ??= base;
     headers['Content-Type'] ??= 'application/json';
   }
   const response = await fetch(`${base}${pathName}`, {
@@ -42,25 +44,66 @@ async function request(base, client, pathName, method = 'GET', body, extra = {})
 }
 
 async function register(base, client, email = 'synthetic-member@example.test') {
+  const password = 'synthetic-member-password-123';
   const response = await request(base, client, '/api/auth/register', 'POST', {
-    name: 'Synthetic Member', email, password: 'synthetic-member-password-123'
+    name: 'Synthetic Member', email, password
   });
   const payload = await response.json();
-  assert.equal(response.status, 201, JSON.stringify(payload));
-  return payload;
+  assert.equal(response.status, 202, JSON.stringify(payload));
+  assert.equal(response.headers.get('set-cookie'), null);
+  const loggedIn = await request(base, client, '/api/auth/login', 'POST', { email, password });
+  assert.equal(loggedIn.status, 200);
+  return loggedIn.json();
 }
 
 const png = Buffer.from([137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 0]);
 
-test('state-changing requests reject foreign origins before authentication or mutation', async t => {
+test('state-changing requests reject missing, foreign, cross-scheme, and cross-site origins before mutation', async t => {
   const { server, base } = await fixture(t);
   const before = server.database.prepare('SELECT COUNT(*) AS n FROM users').get().n;
-  const response = await request(base, null, '/api/auth/register', 'POST', {
-    name: 'Should Not Persist', email: 'foreign@example.test', password: 'synthetic-password-123'
-  }, { Origin: 'https://attacker.example.test' });
-  assert.equal(response.status, 403);
-  assert.match((await response.json()).error, /origin/i);
+  const body = { name: 'Should Not Persist', email: 'foreign@example.test', password: 'synthetic-password-123' };
+  const foreign = await request(base, null, '/api/auth/register', 'POST', body, { Origin: 'https://attacker.example.test' });
+  assert.equal(foreign.status, 403);
+  assert.match((await foreign.json()).error, /origin/i);
+  const missing = await request(base, null, '/api/auth/register', 'POST', body, { omitOrigin: true });
+  assert.equal(missing.status, 403);
+  const wrongScheme = await request(base, null, '/api/auth/register', 'POST', body, { 'x-forwarded-proto': 'https' });
+  assert.equal(wrongScheme.status, 403);
+  const crossSite = await request(base, null, '/api/auth/register', 'POST', body, { 'Sec-Fetch-Site': 'cross-site' });
+  assert.equal(crossSite.status, 403);
   assert.equal(server.database.prepare('SELECT COUNT(*) AS n FROM users').get().n, before);
+});
+
+test('new and duplicate signup addresses receive the same response and neither receives a session', async t => {
+  const { server, base } = await fixture(t);
+  const email = 'registration-privacy@example.test';
+  const first = await request(base, null, '/api/auth/register', 'POST', {
+    name: 'Synthetic First', email, password: 'synthetic-member-password-123'
+  });
+  const firstPayload = await first.json();
+  assert.equal(first.status, 202);
+  assert.equal(first.headers.get('set-cookie'), null);
+  const retry = await request(base, null, '/api/auth/register', 'POST', {
+    name: 'Synthetic Second', email, password: 'different-synthetic-password-456'
+  });
+  assert.equal(retry.status, 202);
+  assert.equal(retry.headers.get('set-cookie'), null);
+  assert.deepEqual(await retry.json(), firstPayload);
+  assert.equal(server.database.prepare('SELECT COUNT(*) AS n FROM users WHERE email=?').get(email).n, 1);
+  assert.equal((await request(base, null, '/api/auth/login', 'POST', { email, password: 'synthetic-member-password-123' })).status, 200);
+  assert.equal((await request(base, null, '/api/auth/login', 'POST', { email, password: 'different-synthetic-password-456' })).status, 401);
+});
+
+test('API write actions receive a shared per-route rate limit', async t => {
+  const { base } = await fixture(t);
+  const statuses = [];
+  for (let attempt = 0; attempt < 61; attempt += 1) {
+    const response = await request(base, null, '/api/profile', 'POST', { name: 'No session', hometown: '', bio: '' });
+    statuses.push(response.status);
+    await response.arrayBuffer();
+  }
+  assert.deepEqual(statuses.slice(0, 60), Array(60).fill(401));
+  assert.equal(statuses[60], 429);
 });
 
 test('authentication failures do not disclose account existence and cookies are hardened', async t => {
