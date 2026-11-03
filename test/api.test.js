@@ -155,6 +155,10 @@ test('community requests require platform review and member approval; moderators
   assert.equal(post.response.status, 201, JSON.stringify(post.data));
   const unauthorizedPin = await call(ctx, member, `/api/posts/${post.data.id}/pin`, 'POST', { pinned: true });
   assert.equal(unauthorizedPin.response.status, 403);
+  const invalidPin = await call(ctx, owner, `/api/posts/${post.data.id}/pin`, 'POST', { pinned: 'false' });
+  assert.equal(invalidPin.response.status, 400, 'pin state must be a JSON boolean, not a truthy string');
+  const stillUnpinned = await call(ctx, member, `/api/feed?community=${communityId}`);
+  assert.equal(stillUnpinned.data.posts[0].pinned, 0);
   const pinned = await call(ctx, owner, `/api/posts/${post.data.id}/pin`, 'POST', { pinned: true });
   assert.equal(pinned.response.status, 200);
   const feed = await call(ctx, member, `/api/feed?community=${communityId}`);
@@ -466,4 +470,154 @@ test('production request errors are redacted from hosted logs and client respons
   assert.equal(logged.length, 1);
   assert.match(logged[0], /^hometown_hub_request_failure /);
   assert.doesNotMatch(logged[0], /SYNTHETIC_PRIVATE_REQUEST_DETAIL|at .*server\.js/);
+});
+
+
+test('members can comment, toggle likes, and share posts idempotently with correct feed counts', async t => {
+  const ctx = await fixture(t), admin = ctx.admin;
+  const owner = { cookie: '' }, member = { cookie: '' }, outsider = { cookie: '' }, anonymous = { cookie: '' };
+  await loginAdmin(ctx, admin);
+  await register(ctx, owner, 'Social Post Owner', 'social-owner@example.test');
+  await register(ctx, member, 'Social Member', 'social-member@example.test');
+  await register(ctx, outsider, 'Social Outsider', 'social-outsider@example.test');
+  const communityId = await createApprovedCommunity(ctx, owner, admin);
+  await joinAndApprove(ctx, member, owner, communityId);
+  const createdPost = await call(ctx, owner, '/api/posts', 'POST', { community_id: communityId, body: 'A synthetic social-interaction post.', category: 'General' });
+  assert.equal(createdPost.response.status, 201, JSON.stringify(createdPost.data));
+  const postId = createdPost.data.id;
+
+  assert.equal((await call(ctx, anonymous, `/api/posts/${postId}/comments`, 'POST', { body: 'Not signed in.' })).response.status, 401);
+  assert.equal((await call(ctx, outsider, `/api/posts/${postId}/like`, 'POST', {})).response.status, 403);
+  assert.equal((await call(ctx, outsider, `/api/posts/${postId}/share`, 'POST', {})).response.status, 403);
+  assert.equal((await call(ctx, member, `/api/posts/${postId}/comments`, 'POST', { body: '   ' })).response.status, 400);
+
+  const comment = await call(ctx, member, `/api/posts/${postId}/comments`, 'POST', { body: '  Helpful local detail.  ' });
+  assert.equal(comment.response.status, 201, JSON.stringify(comment.data));
+  const liked = await call(ctx, member, `/api/posts/${postId}/like`, 'POST', {});
+  assert.equal(liked.response.status, 200);
+  assert.deepEqual(liked.data, { liked: true });
+  const afterLike = await call(ctx, member, `/api/feed?community=${communityId}`);
+  assert.equal(afterLike.response.status, 200);
+  assert.equal(afterLike.data.posts[0].like_count, 1);
+  assert.equal(afterLike.data.posts[0].liked_by_me, true);
+  assert.equal(afterLike.data.posts[0].comment_count, 1);
+  assert.equal(afterLike.data.posts[0].comments[0].body, 'Helpful local detail.');
+  assert.equal(afterLike.data.posts[0].comments[0].user_name, 'Social Member');
+
+  const unliked = await call(ctx, member, `/api/posts/${postId}/like`, 'POST', {});
+  assert.equal(unliked.response.status, 200);
+  assert.deepEqual(unliked.data, { liked: false });
+  const expectedShare = `/?community=${communityId}#post-${postId}`;
+  const firstShare = await call(ctx, member, `/api/posts/${postId}/share`, 'POST', {});
+  const repeatedShare = await call(ctx, member, `/api/posts/${postId}/share`, 'POST', {});
+  assert.equal(firstShare.response.status, 200);
+  assert.deepEqual(firstShare.data, { url: expectedShare });
+  assert.deepEqual(repeatedShare.data, { url: expectedShare });
+  const finalFeed = await call(ctx, member, `/api/feed?community=${communityId}`);
+  assert.equal(finalFeed.data.posts[0].like_count, 0);
+  assert.equal(finalFeed.data.posts[0].liked_by_me, false);
+  assert.equal(finalFeed.data.posts[0].comment_count, 1);
+  assert.equal(finalFeed.data.posts[0].share_count, 1, 'repeated sharing by one member is not double-counted');
+  const ownerNotifications = await call(ctx, owner, '/api/notifications');
+  assert.ok(ownerNotifications.data.notifications.some(note => note.type === 'comment'));
+  assert.ok(ownerNotifications.data.notifications.some(note => note.type === 'like'));
+  assert.equal((await call(ctx, member, '/api/posts/missing-post/like', 'POST', {})).response.status, 404);
+});
+
+test('community moderators can reject join requests and rejected members cannot use the feed until reapproved', async t => {
+  const ctx = await fixture(t), admin = ctx.admin;
+  const owner = { cookie: '' }, applicant = { cookie: '' }, other = { cookie: '' };
+  await loginAdmin(ctx, admin);
+  await register(ctx, owner, 'Rejection Test Owner', 'reject-owner@example.test');
+  await register(ctx, applicant, 'Rejected Applicant', 'rejected-applicant@example.test');
+  await register(ctx, other, 'Non-moderator', 'reject-outsider@example.test');
+  const communityId = await createApprovedCommunity(ctx, owner, admin);
+  const post = await call(ctx, owner, '/api/posts', 'POST', { community_id: communityId, body: 'A post for the membership rejection check.', category: 'General' });
+  assert.equal(post.response.status, 201);
+  const request = await call(ctx, applicant, `/api/communities/${communityId}/join`, 'POST', {});
+  assert.equal(request.response.status, 201);
+  assert.equal(request.data.status, 'pending');
+  assert.equal((await call(ctx, other, `/api/communities/${communityId}/requests/${applicant.userId}`, 'POST', { action: 'reject' })).response.status, 403);
+  assert.equal((await call(ctx, owner, `/api/communities/${communityId}/requests/${applicant.userId}`, 'POST', { action: 'deny' })).response.status, 400);
+  assert.equal((await call(ctx, owner, `/api/communities/${communityId}/requests/missing-member`, 'POST', { action: 'reject' })).response.status, 404);
+
+  const rejected = await call(ctx, owner, `/api/communities/${communityId}/requests/${applicant.userId}`, 'POST', { action: 'reject' });
+  assert.equal(rejected.response.status, 200, JSON.stringify(rejected.data));
+  assert.equal((await call(ctx, applicant, `/api/feed?community=${communityId}`)).response.status, 403);
+  assert.equal((await call(ctx, applicant, `/api/posts/${post.data.id}/like`, 'POST', {})).response.status, 403);
+  const applicantNotifications = await call(ctx, applicant, '/api/notifications');
+  assert.ok(applicantNotifications.data.notifications.some(note => note.type === 'membership_decision' && /declined/i.test(note.message)));
+
+  const retry = await call(ctx, applicant, `/api/communities/${communityId}/join`, 'POST', {});
+  assert.equal(retry.response.status, 201, 'a previously rejected member may submit a fresh request');
+  assert.equal((await call(ctx, owner, `/api/communities/${communityId}/requests/${applicant.userId}`, 'POST', { action: 'approve' })).response.status, 200);
+  assert.equal((await call(ctx, applicant, `/api/feed?community=${communityId}`)).response.status, 200);
+});
+
+test('post and comment deletion is limited to the author, community moderator, or platform admin', async t => {
+  const ctx = await fixture(t), admin = ctx.admin;
+  const owner = { cookie: '' }, author = { cookie: '' }, member = { cookie: '' }, outsider = { cookie: '' }, anonymous = { cookie: '' };
+  await loginAdmin(ctx, admin);
+  await register(ctx, owner, 'Moderation Owner', 'delete-owner@example.test');
+  await register(ctx, author, 'Post Author', 'delete-author@example.test');
+  await register(ctx, member, 'Other Member', 'delete-member@example.test');
+  await register(ctx, outsider, 'Non-member', 'delete-outsider@example.test');
+  const communityId = await createApprovedCommunity(ctx, owner, admin);
+  await joinAndApprove(ctx, author, owner, communityId);
+  await joinAndApprove(ctx, member, owner, communityId);
+
+  const moderatedPost = await call(ctx, author, '/api/posts', 'POST', { community_id: communityId, body: 'A member post for moderation deletion.', category: 'General' });
+  const comment = await call(ctx, member, `/api/posts/${moderatedPost.data.id}/comments`, 'POST', { body: 'A member comment for moderation deletion.' });
+  assert.equal(comment.response.status, 201);
+  assert.equal((await call(ctx, anonymous, `/api/posts/${moderatedPost.data.id}`, 'DELETE', {})).response.status, 401);
+  assert.equal((await call(ctx, member, `/api/posts/${moderatedPost.data.id}`, 'DELETE', {})).response.status, 403);
+  assert.equal((await call(ctx, outsider, `/api/comments/${comment.data.id}`, 'DELETE', {})).response.status, 403);
+  assert.equal((await call(ctx, member, `/api/posts/${moderatedPost.data.id}`, 'DELETE', {})).response.status, 403);
+  assert.equal((await call(ctx, owner, `/api/comments/${comment.data.id}`, 'DELETE', {})).response.status, 200, 'community moderator can remove another member comment');
+  assert.equal((await call(ctx, owner, `/api/posts/${moderatedPost.data.id}`, 'DELETE', {})).response.status, 200, 'community moderator can remove another member post');
+  assert.equal((await call(ctx, author, `/api/posts/${moderatedPost.data.id}`, 'DELETE', {})).response.status, 404, 'deleted post is no longer addressable');
+  assert.equal((await call(ctx, owner, `/api/comments/${comment.data.id}`, 'DELETE', {})).response.status, 404);
+
+  const authorOwnedPost = await call(ctx, author, '/api/posts', 'POST', { community_id: communityId, body: 'The author may remove their own post.', category: 'General' });
+  const authorOwnedComment = await call(ctx, author, `/api/posts/${authorOwnedPost.data.id}/comments`, 'POST', { body: 'The author may also remove their own comment.' });
+  assert.equal(authorOwnedComment.response.status, 201);
+  assert.equal((await call(ctx, author, `/api/comments/${authorOwnedComment.data.id}`, 'DELETE', {})).response.status, 200);
+  assert.equal((await call(ctx, author, `/api/posts/${authorOwnedPost.data.id}`, 'DELETE', {})).response.status, 200);
+  const adminModeratedPost = await call(ctx, author, '/api/posts', 'POST', { community_id: communityId, body: 'An admin can remove this post.', category: 'General' });
+  assert.equal((await call(ctx, admin, `/api/posts/${adminModeratedPost.data.id}`, 'DELETE', {})).response.status, 200);
+});
+
+test('platform administrators can add and delete categories and tags while other users are denied', async t => {
+  const ctx = await fixture(t), admin = ctx.admin, member = { cookie: '' }, anonymous = { cookie: '' };
+  await loginAdmin(ctx, admin);
+  await register(ctx, member, 'Taxonomy Member', 'taxonomy-member@example.test');
+  const categoryPath = '/api/admin/categories';
+  const tagPath = '/api/admin/tags';
+  assert.equal((await call(ctx, anonymous, categoryPath, 'POST', { name: 'Synthetic Category' })).response.status, 401);
+  assert.equal((await call(ctx, member, categoryPath, 'POST', { name: 'Synthetic Category' })).response.status, 403);
+  assert.equal((await call(ctx, member, tagPath, 'POST', { name: 'Synthetic Tag' })).response.status, 403);
+
+  const category = await call(ctx, admin, categoryPath, 'POST', { name: 'Synthetic Category' });
+  assert.equal(category.response.status, 201, JSON.stringify(category.data));
+  assert.deepEqual(category.data, { name: 'Synthetic Category' });
+  assert.equal((await call(ctx, admin, categoryPath, 'POST', { name: 'Synthetic Category' })).response.status, 409);
+  assert.equal((await call(ctx, admin, categoryPath, 'POST', { name: 'A' })).response.status, 400);
+  const tag = await call(ctx, admin, tagPath, 'POST', { name: 'Synthetic Tag' });
+  assert.equal(tag.response.status, 201, JSON.stringify(tag.data));
+  assert.deepEqual(tag.data, { name: 'Synthetic Tag' });
+  assert.equal((await call(ctx, admin, tagPath, 'POST', { name: 'Synthetic Tag' })).response.status, 409);
+  assert.equal((await call(ctx, admin, tagPath, 'POST', { name: 'B' })).response.status, 400);
+  let meta = await call(ctx, member, '/api/meta');
+  assert.ok(meta.data.categories.includes('Synthetic Category'));
+  assert.ok(meta.data.tags.includes('Synthetic Tag'));
+
+  assert.equal((await call(ctx, member, `/api/admin/categories/${encodeURIComponent('Synthetic Category')}`, 'DELETE', {})).response.status, 403);
+  assert.equal((await call(ctx, member, `/api/admin/tags/${encodeURIComponent('Synthetic Tag')}`, 'DELETE', {})).response.status, 403);
+  assert.equal((await call(ctx, admin, '/api/admin/categories/General', 'DELETE', {})).response.status, 400);
+  assert.equal((await call(ctx, admin, `/api/admin/categories/${encodeURIComponent('Synthetic Category')}`, 'DELETE', {})).response.status, 200);
+  assert.equal((await call(ctx, admin, `/api/admin/tags/${encodeURIComponent('Synthetic Tag')}`, 'DELETE', {})).response.status, 200);
+  meta = await call(ctx, member, '/api/meta');
+  assert.equal(meta.data.categories.includes('Synthetic Category'), false);
+  assert.equal(meta.data.categories.includes('General'), true);
+  assert.equal(meta.data.tags.includes('Synthetic Tag'), false);
 });

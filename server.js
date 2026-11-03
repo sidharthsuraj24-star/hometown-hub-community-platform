@@ -34,6 +34,26 @@ function strictBoolean(value, label) {
   return value;
 }
 
+function activityDayKey(value) {
+  if (value instanceof Date && Number.isFinite(value.getTime())) {
+    // node-postgres parses PostgreSQL DATE values as local-time Date objects.
+    const year = String(value.getFullYear()).padStart(4, '0');
+    const month = String(value.getMonth() + 1).padStart(2, '0');
+    const day = String(value.getDate()).padStart(2, '0');
+    return `${year}-${month}-${day}`;
+  }
+  return typeof value === 'string' ? value.slice(0, 10) : '';
+}
+
+function buildDailyActiveTrend(dailyActive, today = new Date()) {
+  const dayOffset = days => new Date(Date.UTC(today.getUTCFullYear(), today.getUTCMonth(), today.getUTCDate() + days)).toISOString().slice(0, 10);
+  const dailyMap = new Map(dailyActive.map(row => [activityDayKey(row.activity_day), Number(row.active_users) || 0]));
+  return Array.from({ length: 30 }, (_, index) => {
+    const day = dayOffset(index - 29);
+    return { day, active_users: dailyMap.get(day) || 0 };
+  });
+}
+
 function passwordHash(password, salt = crypto.randomBytes(16).toString('hex')) {
   return { salt, hash: crypto.scryptSync(password, salt, 64).toString('hex') };
 }
@@ -308,11 +328,7 @@ function createApp(options = {}) {
     };
     const growthRate = values => values.previous ? Math.round(((values.current - values.previous) / values.previous) * 1000) / 10 : null;
     const dailyActive = await many('SELECT activity_day,COUNT(*) AS active_users FROM user_activity WHERE activity_day>=? AND activity_day<=? GROUP BY activity_day ORDER BY activity_day', periodStart, todayKey);
-    const dailyMap = new Map(dailyActive.map(row => [row.activity_day, row.active_users]));
-    const dailyActiveTrend = Array.from({ length: 30 }, (_, index) => {
-      const day = dayOffset(index - 29);
-      return { day, active_users: dailyMap.get(day) || 0 };
-    });
+    const dailyActiveTrend = buildDailyActiveTrend(dailyActive, today);
     return {
       period_days: 30,
       computed_at: currentTime,
@@ -630,7 +646,7 @@ function createApp(options = {}) {
     if (method === 'POST' && parts[1] === 'posts' && parts[2] && parts[3] === 'pin') {
       const user = await requireUser(req), post = await one('SELECT * FROM posts WHERE id=?', parts[2]);
       if (!post) fail(404, 'Post not found.'); await requireModerator(post.community_id, user);
-      const pinned = Boolean(body.pinned);
+      const pinned = strictBoolean(body.pinned, 'Pinned status');
       await run('UPDATE posts SET pinned=? WHERE id=?', isProduction ? pinned : (pinned ? 1 : 0), post.id); send(res, 200, { pinned }); return true;
     }
     if (method === 'DELETE' && parts[1] === 'posts' && parts[2]) {
@@ -944,4 +960,4 @@ if (require.main === module) {
   process.on('SIGINT', shutdown); process.on('SIGTERM', shutdown);
 }
 
-module.exports = { createApp, passwordHash, passwordMatches, fetch, getVercelApp };
+module.exports = { createApp, passwordHash, passwordMatches, buildDailyActiveTrend, fetch, getVercelApp };

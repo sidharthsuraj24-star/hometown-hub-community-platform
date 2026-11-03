@@ -24,4 +24,6 @@ jobs:
         with:
           node-version: 24
       - name: Run syntax and integration checks
+        env:
+          PANDIT_SYNTHETIC_ONLY: '1'
         run: npm run check
