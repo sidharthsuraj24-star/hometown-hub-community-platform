@@ -9,7 +9,7 @@ const { createApp } = require('../server');
 const { initializePanditSchema, SQLITE_SCHEMA } = require('../lib/pandit-onboarding');
 const SYNTHETIC = 'SYNTHETIC RETENTION FIXTURE - NOT A PERSON';
 const PDF = Buffer.from('%PDF-1.4\nSYNTHETIC TEST ONLY - NOT A DOCUMENT\n%%EOF').toString('base64');
-const POLICY = { approved_retention_years: 3, approved_retention_days: null, pending_evidence_retention_days: 90, rejected_evidence_retention_days: 90, rejected_background_check_retention_days: 90, rejected_education_retention_days: 90, appeal_days: 30, recheck_years: 1 };
+const POLICY = { approved_retention_years: 3, approved_retention_days: null, pending_evidence_retention_days: 90, rejected_evidence_retention_days: 90, rejected_background_check_retention_days: 90, rejected_education_retention_days: 90, appeal_days: 30, recheck_years: 2 };
 async function fixture(t, allowPanditSimulations = true) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'hometown-retention-'));
   const server = createApp({ dataDir: dir, nodeEnv: 'test', env: {}, allowPanditSimulations, panditInlineSimulationEvidence: true, panditNow: () => '2035-03-01T00:00:00.000Z', adminEmail: 'admin@example.test', adminPassword: 'synthetic-admin-password-123' });
