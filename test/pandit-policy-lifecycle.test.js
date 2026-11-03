@@ -8,7 +8,7 @@ const { createApp } = require('../server');
 const { addYears, addDays } = require('../lib/pandit-onboarding');
 const PDF = Buffer.from('%PDF-1.4\nSYNTHETIC LIFECYCLE PLACEHOLDER ONLY - NOT A DOCUMENT\n%%EOF').toString('base64');
 const KINDS = ['GOVERNMENT_ID', 'BACKGROUND_CHECK', 'EDUCATION'];
-const POLICY = { approved_retention_years: 3, approved_retention_days: null, pending_evidence_retention_days: 90, rejected_evidence_retention_days: 90, rejected_background_check_retention_days: 90, rejected_education_retention_days: 90, appeal_days: 30, recheck_years: 1 };
+const POLICY = { approved_retention_years: 3, approved_retention_days: null, pending_evidence_retention_days: 90, rejected_evidence_retention_days: 90, rejected_background_check_retention_days: 90, rejected_education_retention_days: 90, appeal_days: 30, recheck_years: 2 };
 const PROFILE = { is_simulation: true, display_name: 'SYNTHETIC LIFECYCLE FIXTURE - NOT A PERSON', location: 'Synthetic test locality', description: 'Synthetic lifecycle assertions only; not a real applicant.', traditions: 'Synthetic', languages: 'Synthetic', ritual_skills: 'Synthetic', experience_years: 0 };
 async function setup(t, start = '2032-02-29T12:34:56.789Z') {
   let clock = Date.parse(start);
@@ -46,14 +46,15 @@ test('actual independent approval snapshots three calendar years and expires evi
   const f = await setup(t); const { client } = await f.ready('approval'); let a = await f.review(client, 'APPROVED');
   assert.equal(a.is_simulation, 1); assert.equal(a.status, 'APPROVED');
   assert.equal(a.approved_record_until, '2035-02-28T12:34:56.789Z');
-  assert.equal(a.reverify_at, '2033-02-28T12:34:56.789Z');
+  assert.equal(a.reverify_at, '2034-02-28T12:34:56.789Z');
   assert.ok(a.evidence.every(e => e.delete_after === a.approved_record_until && e.verified === 1));
   assert.equal((await f.call(client, '/api/pandits')).data.pandits.length, 0);
   assert.equal((await f.call(f.admin, `/api/admin/pandits/${a.id}/evidence/${a.evidence[0].id}`)).status, 403);
+  assert.equal((await f.call(f.admin, '/api/admin/pandits/policy', 'PUT', { ...POLICY, recheck_years: 1 })).status, 400);
   assert.equal((await f.call(f.admin, '/api/admin/pandits/policy', 'PUT', { ...POLICY, approved_retention_years: 4 })).status, 200);
   assert.equal((await f.own(client)).approved_record_until, a.approved_record_until, 'policy edits never backfill existing decisions');
   const deadline = Date.parse(a.approved_record_until); f.at(deadline - 1); a = await f.own(client);
-  assert.equal(a.status, 'ACTION_REQUIRED', 'existing one-year reverification stays in force'); assert.equal(a.evidence.length, 3);
+  assert.equal(a.status, 'ACTION_REQUIRED', 'two-year reverification is due before the three-year evidence expiry'); assert.equal(a.evidence.length, 3);
   f.at(deadline); const results = await Promise.all(Array.from({ length: 6 }, () => f.own(client)));
   assert.ok(results.every(x => x.evidence.length === 0 && x.id === a.id && x.status === 'ACTION_REQUIRED'));
   a = await f.own(client); assert.equal(a.evidence_expired_at, '2035-02-28T12:34:56.789Z'); assert.equal(a.approved_record_until, null);

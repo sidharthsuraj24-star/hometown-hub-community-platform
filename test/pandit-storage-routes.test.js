@@ -16,7 +16,7 @@ const PNG = Buffer.from([137,80,78,71,13,10,26,10,0,0,0,0]);
 const JPEG = Buffer.from([255,216,255,224,0,16,74,70,73,70,0,1]);
 const PASSWORD = 'synthetic-pandit-route-password-123';
 const PROFILE = { display_name: 'Synthetic Pandit', location: 'Synthetic town', description: 'A synthetic profile with enough description for route tests.', traditions: 'Synthetic tradition', languages: 'Synthetic language', ritual_skills: 'Synthetic rituals', experience_years: 5 };
-const POLICY = { approved_retention_years: 3, approved_retention_days: null, rejected_evidence_retention_days: 90, appeal_days: 30, recheck_years: 1, pending_evidence_retention_days: 90, rejected_background_check_retention_days: 90, rejected_education_retention_days: 90 };
+const POLICY = { approved_retention_years: 3, approved_retention_days: null, rejected_evidence_retention_days: 90, appeal_days: 30, recheck_years: 2, pending_evidence_retention_days: 90, rejected_background_check_retention_days: 90, rejected_education_retention_days: 90 };
 
 function base64(bytes) { return Buffer.from(bytes).toString('base64'); }
 function noSecrets(value) { const text = JSON.stringify(value); assert.equal(text.includes('mock-service-key'), false); assert.equal(text.includes('supabase.test'), false); assert.equal(text.includes(BUCKET), false); }

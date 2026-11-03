@@ -25,8 +25,8 @@ function ui() {
   context.ui.state.user = { id: 'synthetic-viewer', name: 'SYNTHETIC TEST USER', role: 'user' };
   return { context, api: context.ui, listeners };
 }
-const policy = { approved_retention_years: 3, approved_retention_days: null, rejected_evidence_retention_days: 90, pending_evidence_retention_days: 90, rejected_background_check_retention_days: 90, rejected_education_retention_days: 90, appeal_days: 30, recheck_years: 1 };
-const legacyPolicy = { approved_retention_years: null, approved_retention_days: 10, rejected_evidence_retention_days: 90, pending_evidence_retention_days: 90, rejected_background_check_retention_days: 90, rejected_education_retention_days: 90, appeal_days: 30, recheck_years: 1 }; // Disposable UI-test settings only.
+const policy = { approved_retention_years: 3, approved_retention_days: null, rejected_evidence_retention_days: 90, pending_evidence_retention_days: 90, rejected_background_check_retention_days: 90, rejected_education_retention_days: 90, appeal_days: 30, recheck_years: 2 };
+const legacyPolicy = { approved_retention_years: null, approved_retention_days: 10, rejected_evidence_retention_days: 90, pending_evidence_retention_days: 90, rejected_background_check_retention_days: 90, rejected_education_retention_days: 90, appeal_days: 30, recheck_years: 2 }; // Disposable UI-test settings only.
 const application = {
   id: 'synthetic-application', user_id: 'synthetic-applicant', is_simulation: true,
   display_name: 'SYNTHETIC TEST PROFILE — NOT A PERSON', location: 'Synthetic town',

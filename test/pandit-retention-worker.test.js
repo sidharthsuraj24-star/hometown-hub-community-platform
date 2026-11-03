@@ -215,7 +215,9 @@ test('worker blocks cleanup when the approved two-year recheck policy has drifte
   const activity = '2035-01-01T00:00:00.000Z';
   const app = insertApplication(db, { activity });
   const evidence = insertEvidence(db, harness, app, { basis: 'PENDING', deadline: addDays(activity, 90) });
+  db.exec('PRAGMA ignore_check_constraints=ON');
   db.prepare('UPDATE pandit_policy SET recheck_years=1 WHERE id=1').run();
+  db.exec('PRAGMA ignore_check_constraints=OFF');
 
   const result = await worker({ db, transaction, harness, now: () => addDays(activity, 100) }).runOnce();
   assert.deepEqual(result, { skipped: true, reason: 'approved-policy-not-ready', deletedEvidence: 0, deletedReservations: 0, skippedUnsafe: 0 });

@@ -4,8 +4,7 @@ const test = require('node:test');
 const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const { DatabaseSync } = require('node:sqlite');
-const { SQLITE_SCHEMA, STATUSES, KINDS } = require('../lib/pandit-onboarding');
-
+const { SQLITE_SCHEMA, STATUSES, KINDS, APPROVED_POLICY } = require('../lib/pandit-onboarding');
 const migration = fs.readFileSync(require.resolve('../supabase/migrations/004_pandit_onboarding.sql'), 'utf8');
 const runtime = fs.readFileSync(require.resolve('../lib/pandit-onboarding.js'), 'utf8');
 const TABLES = ['pandit_applications', 'pandit_evidence', 'pandit_roles', 'pandit_policy', 'pandit_reviews'];
@@ -93,6 +92,8 @@ test('SQLite and PostgreSQL runtime flags use compatible numeric storage and ret
 test('Pandit constants and migration security constraints are explicit', () => {
   assert.deepEqual(STATUSES, ['PENDING_VERIFICATION', 'ACTION_REQUIRED', 'APPROVED', 'REJECTED']);
   assert.deepEqual(KINDS, ['GOVERNMENT_ID', 'BACKGROUND_CHECK', 'EDUCATION']);
+  assert.equal(APPROVED_POLICY.recheck_years, 2);
+  assert.match(SQLITE_SCHEMA, /recheck_years INTEGER NOT NULL DEFAULT 2 CHECK\(recheck_years = 2\)/);
   assert.match(migration, /is_simulation integer not null default 0 check \(is_simulation = 0\)/i);
   assert.match(migration, /constraint pandit_evidence_exactly_one_source check \(\(storage_path is null\) <> \(content_base64 is null\)\)/i);
   assert.match(migration, /retention_basis text check[\s\S]*APPROVED[\s\S]*PENDING[\s\S]*REJECTED_BACKGROUND_CHECK[\s\S]*REJECTED_EDUCATION[\s\S]*REJECTED_GOVERNMENT_ID/i);
@@ -108,6 +109,18 @@ test('Pandit constants and migration security constraints are explicit', () => {
   assert.doesNotMatch(executableSql, /revoke[^;]+storage\.(objects|buckets)/i, 'do not change unrelated bucket privileges');
   assert.match(migration, /check \(approved_retention_days is null or approved_retention_years is null\)/i, 'unset policy is allowed but ambiguous units are not');
   assert.doesNotMatch(executableSql, /insert\s+into\s+(pandit_policy|pandit_roles|pandit_applications|pandit_evidence)\b/i, 'no policy decisions or users/documents are seeded');
+});
+
+test('existing local one-year Pandit recheck configuration is normalized to the required two-year interval', () => {
+  const { initializePanditSchema } = require('../lib/pandit-onboarding');
+  const db = new DatabaseSync(':memory:');
+  try {
+    db.exec('CREATE TABLE users (id TEXT PRIMARY KEY, email TEXT, role TEXT, disabled INTEGER DEFAULT 0);');
+    const oldSchema = SQLITE_SCHEMA.replace('recheck_years INTEGER NOT NULL DEFAULT 2 CHECK(recheck_years = 2)', 'recheck_years INTEGER NOT NULL DEFAULT 1 CHECK(recheck_years IN (1,2))');
+    db.exec(oldSchema);
+    initializePanditSchema(db);
+    assert.equal(db.prepare('SELECT recheck_years FROM pandit_policy WHERE id=1').get().recheck_years, 2);
+  } finally { db.close(); }
 });
 
 test('existing local evidence CHECK constraints upgrade without losing records or backfilling deadlines', () => {

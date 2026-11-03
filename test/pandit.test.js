@@ -41,7 +41,7 @@ async function register(ctx, email, name = 'Synthetic User') {
 }
 async function loginAdmin(ctx) { const c = { cookie: '' }; const r = await call(ctx, c, '/api/auth/login', 'POST', { email: 'admin@example.test', password: 'test-admin-password-123' }); assert.equal(r.response.status, 200); c.userId = r.data.user.id; return c; }
 function profile(revision, action = 'save', extra = {}) { return { ...PROFILE, revision, action, is_simulation: true, ...extra }; }
-async function configure(ctx, admin, extra = {}) { return call(ctx, admin, '/api/admin/pandits/policy', 'PUT', { approved_retention_days: 10, rejected_evidence_retention_days: 3, appeal_days: 2, recheck_years: 1, ...extra }); }
+async function configure(ctx, admin, extra = {}) { return call(ctx, admin, '/api/admin/pandits/policy', 'PUT', { approved_retention_days: 10, rejected_evidence_retention_days: 3, appeal_days: 2, recheck_years: 2, ...extra }); }
 async function evidence(ctx, c, revision, kind, extra = {}) { return call(ctx, c, '/api/pandit-application/evidence', 'POST', { revision, kind, content_type: 'application/pdf', content_base64: PDF, ...extra }); }
 
  test('updated Pandit workflow: privacy, three roles, immutable simulation designation, concurrency and bounded transitions', async t => {
@@ -164,7 +164,7 @@ test('periodic and immediate reverification invalidate every checked evidence it
     a = (await call(ctx, applicant, '/api/pandit-application')).data.application;
   };
   await approve();
-  assert.equal(a.reverify_at, '2032-01-01T00:00:00.000Z');
+  assert.equal(a.reverify_at, '2033-01-01T00:00:00.000Z');
   clock = Date.parse(a.reverify_at);
   a = (await call(ctx, applicant, '/api/pandit-application')).data.application;
   assert.equal(a.status, 'ACTION_REQUIRED');
@@ -223,7 +223,7 @@ test('missing policy, invalid periods, forged roles and malformed private eviden
   const checker = await register(ctx, 'synthetic-policy-checker@example.test');
   await assign(ctx, admin, checker, 'CHECKER');
   let a = (await call(ctx, applicant, '/api/pandit-application', 'POST', profile(0))).data.application;
-  for (const extra of [{ approved_retention_days: 0 }, { appeal_days: -1 }, { appeal_days: 1.5 }, { recheck_years: 3 }]) {
+  for (const extra of [{ approved_retention_days: 0 }, { appeal_days: -1 }, { appeal_days: 1.5 }, { recheck_years: 1 }, { recheck_years: 3 }]) {
     assert.equal((await configure(ctx, admin, extra)).response.status, 400);
   }
   assert.equal((await configure(ctx, checker)).response.status, 403);
@@ -268,7 +268,7 @@ test('local legacy schema upgrades without seeds, obsolete sensitive fields, or 
     assert.ok(!columns.includes('vetting_details') && !columns.includes('private_note'));
     assert.equal(db.prepare('SELECT COUNT(*) AS count FROM pandit_applications').get().count, 0);
     assert.equal(db.prepare('SELECT COUNT(*) AS count FROM pandit_evidence').get().count, 0);
-    assert.deepEqual({ ...db.prepare('SELECT approved_retention_years,approved_retention_days,pending_evidence_retention_days,rejected_evidence_retention_days,rejected_background_check_retention_days,rejected_education_retention_days,appeal_days,recheck_years FROM pandit_policy').get() }, { approved_retention_years: 3, approved_retention_days: null, pending_evidence_retention_days: 90, rejected_evidence_retention_days: 90, rejected_background_check_retention_days: 90, rejected_education_retention_days: 90, appeal_days: 30, recheck_years: 1 });
+    assert.deepEqual({ ...db.prepare('SELECT approved_retention_years,approved_retention_days,pending_evidence_retention_days,rejected_evidence_retention_days,rejected_background_check_retention_days,rejected_education_retention_days,appeal_days,recheck_years FROM pandit_policy').get() }, { approved_retention_years: 3, approved_retention_days: null, pending_evidence_retention_days: 90, rejected_evidence_retention_days: 90, rejected_background_check_retention_days: 90, rejected_education_retention_days: 90, appeal_days: 30, recheck_years: 2 });
     assert.equal(db.prepare('PRAGMA foreign_key_check').all().length, 0);
     assert.match(db.prepare("SELECT sql FROM sqlite_master WHERE name='pandit_applications'").get().sql, /'ACTION_REQUIRED'/);
   } finally { db.close(); }
